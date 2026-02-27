@@ -1,0 +1,23 @@
+[project]
+name = "agentmarket"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Johnkb-git",email = "55041938+Johnkb-git@users.noreply.github.com"}
+]
+requires-python = ">=3.11,<4.0.0"
+dependencies = [
+    "fastapi (>=0.133.1,<0.134.0)",
+    "uvicorn (>=0.41.0,<0.42.0)",
+    "python-dotenv (>=1.2.1,<2.0.0)",
+    "boto3 (>=1.42.58,<2.0.0)",
+    "anthropic (>=0.84.0,<0.85.0)",
+    "langchain (>=1.2.10,<2.0.0)",
+    "langchain-anthropic (>=1.3.4,<2.0.0)",
+    "pydantic-settings (>=2.0.0,<3.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
