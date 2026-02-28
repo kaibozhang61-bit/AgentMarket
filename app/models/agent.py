@@ -1,14 +1,18 @@
 """
 Pydantic schemas for the Agent module.
 
-Used by:
-  - routes layer  (request body / response serialization)
-  - service layer (typed input parameters)
+Agent types
+-----------
+Simple agent   — steps list with exactly 1 step of type="llm"
+Composite agent — steps list with 2+ steps (type="llm" or type="agent")
+
+systemPrompt no longer lives at the top level; it is a field inside
+each type="llm" step.
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -24,12 +28,42 @@ class FieldSchema(BaseModel):
     description: str = ""
 
 
+# ── Step types ────────────────────────────────────────────────────────────────
+
+class LLMStep(BaseModel):
+    """A step that calls an LLM directly with a system prompt."""
+    stepId: str = ""            # auto-assigned by DAO if empty
+    order: int
+    type: Literal["llm"]
+    systemPrompt: str
+    inputSchema: list[FieldSchema] = Field(default_factory=list)
+    outputSchema: list[FieldSchema] = Field(default_factory=list)
+    transformMode: str = "auto"
+    inputMapping: dict[str, str] = Field(default_factory=dict)
+    missingFieldsResolution: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentRefStep(BaseModel):
+    """A step that delegates to another Agent in the marketplace."""
+    stepId: str = ""            # auto-assigned by DAO if empty
+    order: int
+    type: Literal["agent"]
+    agentId: str
+    transformMode: str = "auto"
+    inputMapping: dict[str, str] = Field(default_factory=dict)
+    missingFieldsResolution: dict[str, Any] = Field(default_factory=dict)
+
+
+# Discriminated union — Pydantic picks the right model based on "type" field
+Step = Annotated[Union[LLMStep, AgentRefStep], Field(discriminator="type")]
+
+
 # ── Request bodies ────────────────────────────────────────────────────────────
 
 class AgentCreateRequest(BaseModel):
     name: str
     description: str = ""
-    systemPrompt: str
+    steps: list[Step] = Field(min_length=1)   # at least 1 step required
     inputSchema: list[FieldSchema] = Field(default_factory=list)
     outputSchema: list[FieldSchema] = Field(default_factory=list)
     visibility: Literal["public", "private"] = "private"
@@ -40,7 +74,7 @@ class AgentUpdateRequest(BaseModel):
     """All fields are optional — only provided fields are updated."""
     name: str | None = None
     description: str | None = None
-    systemPrompt: str | None = None
+    steps: list[Step] | None = None
     inputSchema: list[FieldSchema] | None = None
     outputSchema: list[FieldSchema] | None = None
     visibility: Literal["public", "private"] | None = None
@@ -61,11 +95,12 @@ class AgentResponse(BaseModel):
     status: str
     visibility: str
     version: str
-    systemPrompt: str
-    inputSchema: list[FieldSchema]
-    outputSchema: list[FieldSchema]
+    steps: list[dict[str, Any]]
+    inputSchema: list[dict[str, Any]]
+    outputSchema: list[dict[str, Any]]
     toolsRequired: list[str]
     callCount: int
+    lastUsedAt: str | None = None
     createdAt: str
     updatedAt: str
     # Incremental 2

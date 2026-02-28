@@ -61,17 +61,23 @@ class WorkflowRunDAO(BaseDAO):
         status: str,
         step_results: list[dict] | None = None,
         finished: bool = False,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Update run status and optionally replace the full stepResults list.
 
-        finished=True sets finishedAt to now (for terminal states: success / failed).
+        finished=True  → sets finishedAt to now (terminal states: success / failed).
+        extra          → arbitrary additional fields to persist, e.g.
+                         {"pendingStepId": "...", "pendingStepOrder": 2}
+                         used to save pause state for the resume endpoint.
         """
         fields: dict[str, Any] = {"status": status}
         if step_results is not None:
             fields["stepResults"] = step_results
         if finished:
             fields["finishedAt"] = datetime.now(timezone.utc).isoformat()
+        if extra:
+            fields.update(extra)
 
         expr, names, values = self._build_update_expr(fields)
         resp = self._table.update_item(

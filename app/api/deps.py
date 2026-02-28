@@ -4,30 +4,24 @@ FastAPI dependency functions shared across all route modules.
 
 from __future__ import annotations
 
-import base64
-import json
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, Header, HTTPException, status
+from jwt import PyJWTError
+
+from app.core.cognito import verify_token
 
 
-def get_current_user_id(
+def get_current_user_claims(
     authorization: Annotated[str | None, Header()] = None,
-) -> str:
+) -> dict[str, Any]:
     """
-    Extract the Cognito userId (JWT 'sub' claim) from the Authorization header.
+    Verify the Bearer token and return the full JWT claims dict.
 
-    Expected header:
-        Authorization: Bearer <cognito_id_token>
-
-    Development note:
-        Signature verification is intentionally skipped here — the payload is
-        only base64-decoded. Before going to production, replace this function
-        body with proper Cognito JWKS verification.
-
-        Reference:
-        https://docs.aws.amazon.com/cognito/latest/developerguide/
-        amazon-cognito-user-pools-using-tokens-verifying-a-jwt.html
+    Raises HTTP 401 if the header is missing or the token is invalid.
+    All other auth dependencies delegate to this one, so the token is
+    verified exactly once per request (FastAPI deduplicates dependencies
+    by function reference).
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
@@ -37,25 +31,35 @@ def get_current_user_id(
         )
 
     token = authorization.removeprefix("Bearer ").strip()
-
     try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            raise ValueError("not a JWT")
-        # Pad to a multiple of 4 for urlsafe_b64decode
-        padded = parts[1] + "=" * (-len(parts[1]) % 4)
-        payload: dict = json.loads(base64.urlsafe_b64decode(padded))
-        user_id: str | None = payload.get("sub")
-        if not user_id:
-            raise ValueError("missing sub claim")
-        return user_id
-    except Exception:
+        return verify_token(token)
+    except PyJWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
+            detail=f"Could not validate credentials: {exc}",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
 
-# Convenient type alias for route signatures
+def get_current_user_id(
+    claims: Annotated[dict[str, Any], Depends(get_current_user_claims)],
+) -> str:
+    """Extract the Cognito userId (JWT 'sub' claim) from verified claims."""
+    user_id: str | None = claims.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token is missing the 'sub' claim",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user_id
+
+
+# ── Convenient type aliases for route signatures ───────────────────────────────
+
+# Full claims dict — use when the route needs email / username from the token
+# (e.g. GET /users/me auto-creates the DDB record on first login).
+CurrentUserClaims = Annotated[dict[str, Any], Depends(get_current_user_claims)]
+
+# Just the userId string — use for all other protected routes.
 CurrentUserId = Annotated[str, Depends(get_current_user_id)]

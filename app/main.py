@@ -33,10 +33,14 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from app.api.routes import agents, marketplace
+from app.api.routes import agents, marketplace, orchestrator, runs, users, workflows
 
-app.include_router(agents.router,      prefix="/agents",      tags=["Agents"])
-app.include_router(marketplace.router, prefix="/marketplace", tags=["Marketplace"])
+app.include_router(users.router,        prefix="/users",        tags=["Users"])
+app.include_router(agents.router,       prefix="/agents",       tags=["Agents"])
+app.include_router(marketplace.router,  prefix="/marketplace",  tags=["Marketplace"])
+app.include_router(workflows.router,    prefix="/workflows",    tags=["Workflows"])
+app.include_router(runs.router,         prefix="/workflows",    tags=["WorkflowRuns"])
+app.include_router(orchestrator.router, prefix="/orchestrator", tags=["Orchestrator"])
 
 # Uncomment as each module is implemented:
 # from app.api.routes import users, workflows, orchestrator, connections

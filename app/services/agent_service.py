@@ -1,15 +1,5 @@
 """
 AgentService — business logic for the Agent module.
-
-Responsibilities:
-  - Ownership / permission checks
-  - Data shaping before writing to DDB (strip None values, build safe dicts)
-  - LLM call for /test endpoint
-  - Status-transition logic for /publish endpoint
-
-The service layer never touches HTTP concerns (no Request / Response / HTTPException
-from starlette — only FastAPI's HTTPException is used here because it is a plain
-Python exception, not HTTP middleware).
 """
 
 from __future__ import annotations
@@ -26,19 +16,30 @@ from app.dao.agent_dao import AgentDAO
 from app.models.agent import AgentCreateRequest, AgentUpdateRequest
 
 _settings = get_settings()
-
-# One shared Anthropic client for the process
 _llm = anthropic.Anthropic(api_key=_settings.anthropic_api_key)
 
 
 def _schemas_to_ddb(schemas: list) -> list[dict[str, Any]]:
-    """
-    Serialize a list of FieldSchema objects (or already-plain dicts) to a
-    DynamoDB-safe list, stripping any None values DDB would reject.
-    """
+    """Serialize FieldSchema objects to DDB-safe dicts (strip None values)."""
     result = []
     for s in schemas:
         d = s.model_dump() if hasattr(s, "model_dump") else dict(s)
+        result.append({k: v for k, v in d.items() if v is not None})
+    return result
+
+
+def _steps_to_ddb(steps: list) -> list[dict[str, Any]]:
+    """Serialize Step objects to DDB-safe dicts (strip None values)."""
+    result = []
+    for s in steps:
+        d = s.model_dump() if hasattr(s, "model_dump") else dict(s)
+        # Recursively strip None from nested schema lists
+        if "inputSchema" in d:
+            d["inputSchema"] = [{k: v for k, v in f.items() if v is not None}
+                                for f in (d["inputSchema"] or [])]
+        if "outputSchema" in d:
+            d["outputSchema"] = [{k: v for k, v in f.items() if v is not None}
+                                 for f in (d["outputSchema"] or [])]
         result.append({k: v for k, v in d.items() if v is not None})
     return result
 
@@ -73,7 +74,7 @@ class AgentService:
         data: dict[str, Any] = {
             "name": body.name,
             "description": body.description,
-            "systemPrompt": body.systemPrompt,
+            "steps": _steps_to_ddb(body.steps),
             "inputSchema": _schemas_to_ddb(body.inputSchema),
             "outputSchema": _schemas_to_ddb(body.outputSchema),
             "visibility": body.visibility,
@@ -83,10 +84,6 @@ class AgentService:
         return self._dao.create(data)
 
     def get(self, agent_id: str, requester_id: str) -> dict[str, Any]:
-        """
-        Private management view — only the owner can retrieve via this endpoint.
-        Public discovery goes through /marketplace/agents.
-        """
         agent = self._get_or_404(agent_id)
         self._assert_owner(agent, requester_id)
         return agent
@@ -97,17 +94,17 @@ class AgentService:
         agent = self._get_or_404(agent_id)
         self._assert_owner(agent, requester_id)
 
-        # Build update dict — only fields explicitly set in the request
         fields: dict[str, Any] = body.model_dump(exclude_none=True)
 
-        # Re-serialize schema lists to strip nested None values
+        if body.steps is not None:
+            fields["steps"] = _steps_to_ddb(body.steps)
         if body.inputSchema is not None:
             fields["inputSchema"] = _schemas_to_ddb(body.inputSchema)
         if body.outputSchema is not None:
             fields["outputSchema"] = _schemas_to_ddb(body.outputSchema)
 
         if not fields:
-            return agent  # nothing to update
+            return agent
 
         updated = self._dao.update(agent_id, agent["version"], fields)
         if not updated:
@@ -122,20 +119,16 @@ class AgentService:
     # ── Business actions ──────────────────────────────────────────────────────
 
     def publish(self, agent_id: str, requester_id: str) -> dict[str, Any]:
-        """
-        Transition agent status: draft → published.
-        Idempotent: calling publish on an already-published agent is a no-op.
-        """
         agent = self._get_or_404(agent_id)
         self._assert_owner(agent, requester_id)
 
         if agent["status"] == "published":
-            return agent  # already published
+            return agent
 
         updated = self._dao.update(
             agent_id,
             agent["version"],
-            {"status": "published"},
+            {"status": "published", "visibility": "public"},
         )
         return updated  # type: ignore[return-value]
 
@@ -146,16 +139,24 @@ class AgentService:
         input_data: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Run the agent against sample input using Claude Haiku.
-        Returns the model output and wall-clock latency in ms.
+        Test the agent with sample input.
+        Only works for simple agents (single type=llm step).
+        systemPrompt is read from the first llm step.
         """
         agent = self._get_or_404(agent_id)
         self._assert_owner(agent, requester_id)
 
-        system_prompt: str = agent.get("systemPrompt", "")
-        output_schema: list = agent.get("outputSchema", [])
+        steps: list[dict] = agent.get("steps", [])
+        llm_step = next((s for s in steps if s.get("type") == "llm"), None)
+        if not llm_step:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Agent has no LLM step — only simple agents (type=llm) can be tested here",
+            )
 
-        # Append output-format instruction so the model returns parseable JSON
+        system_prompt: str = llm_step.get("systemPrompt", "")
+        output_schema: list = llm_step.get("outputSchema") or agent.get("outputSchema", [])
+
         if output_schema:
             schema_hint = {f["fieldName"]: f["type"] for f in output_schema}
             system_prompt = (
@@ -177,7 +178,6 @@ class AgentService:
         try:
             output = json.loads(raw)
         except json.JSONDecodeError:
-            # Model didn't return valid JSON — surface raw text under a key
             output = {"raw": raw}
 
         return {"output": output, "latency_ms": latency_ms}

@@ -93,17 +93,22 @@ class WorkflowDAO(BaseDAO):
         steps.append(step)
         return self.update(workflow_id, {"steps": steps})
 
-    def update_step(
-        self, workflow_id: str, step_id: str, fields: dict[str, Any]
+    def replace_step(
+        self, workflow_id: str, step_id: str, new_step: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Update a single step in the steps list by stepId."""
+        """
+        Fully replace a step (PUT semantics).
+        new_step must contain all required fields including stepId.
+        Using full replacement avoids stale fields when the step type changes
+        (e.g. AGENT → LLM would otherwise retain orphaned agentId / inputMapping).
+        """
         workflow = self.get(workflow_id)
         if not workflow:
             return None
         steps: list = workflow.get("steps", [])
         for i, s in enumerate(steps):
             if s.get("stepId") == step_id:
-                steps[i] = {**s, **fields}
+                steps[i] = new_step
                 return self.update(workflow_id, {"steps": steps})
         return None
 
