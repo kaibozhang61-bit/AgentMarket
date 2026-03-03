@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Search } from "lucide-react";
+import { AppLayout } from "@/components/layout/app-layout";
 import { marketplaceApi } from "@/lib/api";
 import type { MarketplaceAgent } from "@/lib/types";
 
@@ -33,18 +34,14 @@ export default function MarketplacePage() {
   }
 
   return (
-    <div className="min-h-screen bg-neutral-50">
-      {/* Header */}
-      <header className="border-b bg-white px-6 py-4">
-        <div className="mx-auto max-w-5xl">
+    <AppLayout>
+      <div className="space-y-6">
+        <div>
           <h1 className="text-xl font-semibold">Agent Marketplace</h1>
           <p className="mt-0.5 text-sm text-neutral-500">
             Discover and reuse AI agents built by the community
           </p>
         </div>
-      </header>
-
-      <div className="mx-auto max-w-5xl p-6 space-y-6">
         {/* Search */}
         <form onSubmit={handleSearch} className="relative">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-neutral-400" />
@@ -116,6 +113,6 @@ export default function MarketplacePage() {
           </div>
         )}
       </div>
-    </div>
+    </AppLayout>
   );
 }

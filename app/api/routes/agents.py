@@ -9,7 +9,7 @@ Agent router — /agents
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.deps import CurrentUserId
 from app.models.agent import (
@@ -17,10 +17,14 @@ from app.models.agent import (
     AgentListResponse,
     AgentResponse,
     AgentTestRequest,
+    AgentTestStepRequest,
     AgentTestResponse,
     AgentUpdateRequest,
+    AgentValidateResponse,
 )
+from app.models.agent_chat import AgentChatRequest, AgentChatResponse
 from app.services.agent_service import AgentService
+from app.services.agent_chat_service import AgentChatService
 
 router = APIRouter()
 
@@ -29,7 +33,12 @@ def _svc() -> AgentService:
     return AgentService()
 
 
+def _chat_svc() -> AgentChatService:
+    return AgentChatService()
+
+
 AgentServiceDep = Annotated[AgentService, Depends(_svc)]
+AgentChatServiceDep = Annotated[AgentChatService, Depends(_chat_svc)]
 
 
 # ── GET /agents/me  ───────────────────────────────────────────────────────────
@@ -47,6 +56,36 @@ def list_my_agents(
     """Return all agents created by the authenticated user."""
     agents = svc.list_mine(current_user_id)
     return AgentListResponse(agents=agents, total=len(agents))
+
+
+# ── POST /agents/chat  ───────────────────────────────────────────────────────
+# Declared before /{agent_id} so "chat" is not captured as a path param.
+
+@router.post(
+    "/chat",
+    response_model=AgentChatResponse,
+    status_code=status.HTTP_200_OK,
+    summary="LLM-driven agent creation chat",
+)
+def agent_chat(
+    body: AgentChatRequest,
+    current_user_id: CurrentUserId,
+    svc: AgentChatServiceDep,
+) -> AgentChatResponse:
+    """
+    4-stage conversational agent builder.
+
+    On the first call, omit sessionId and agentId — the backend creates both.
+    On subsequent calls, send back the sessionId and agentId from the
+    previous response so the backend can resume the conversation.
+    """
+    result = svc.chat(
+        user_id=current_user_id,
+        message=body.message,
+        session_id=body.sessionId,
+        agent_id=body.agentId,
+    )
+    return AgentChatResponse(**result)
 
 
 # ── POST /agents  ─────────────────────────────────────────────────────────────
@@ -153,3 +192,120 @@ def test_agent(
     Returns the model output and wall-clock latency in milliseconds.
     """
     return svc.test(agent_id, current_user_id, body.input)  # type: ignore[return-value]
+
+
+# ── POST /agents/{agent_id}/test-step  ───────────────────────────────────────
+
+@router.post(
+    "/{agent_id}/test-step",
+    response_model=AgentTestResponse,
+    summary="Test a single step with sample input",
+)
+def test_step(
+    agent_id: str,
+    body: AgentTestStepRequest,
+    current_user_id: CurrentUserId,
+    svc: AgentServiceDep,
+) -> AgentTestResponse:
+    """
+    Run a single step in isolation using Claude Haiku.
+    Ephemeral — results are not persisted.
+    Only LLM steps are supported; agent steps return 400.
+    """
+    return svc.test_step(agent_id, current_user_id, body.stepId, body.input)  # type: ignore[return-value]
+
+
+# ── POST /agents/{agent_id}/validate  ────────────────────────────────────────
+
+@router.post(
+    "/{agent_id}/validate",
+    response_model=AgentValidateResponse,
+    summary="Validate agent schema compatibility",
+)
+def validate_agent(
+    agent_id: str,
+    current_user_id: CurrentUserId,
+    svc: AgentServiceDep,
+) -> AgentValidateResponse:
+    """
+    Check whether all required input fields for each step can be resolved
+    from context, inputMapping, missingFieldsResolution, or outputs of
+    earlier steps. Returns a list of issues with suggestions for fixing.
+    """
+    return svc.validate(agent_id, current_user_id)  # type: ignore[return-value]
+
+
+# ── GET /agents/{agent_id}/session  ──────────────────────────────────────────
+
+@router.get(
+    "/{agent_id}/session",
+    status_code=status.HTTP_200_OK,
+    summary="Get latest chat session for an agent",
+)
+def get_agent_session(
+    agent_id: str,
+    current_user_id: CurrentUserId,
+    svc: AgentServiceDep,
+    chat_svc: AgentChatServiceDep,
+) -> dict:
+    """
+    Return the latest chat session for a draft agent so the user can
+    resume the conversation. Returns 404 if no session exists.
+    """
+    agent = svc.get(agent_id, current_user_id)
+    from app.dao.agent_chat_session_dao import AgentChatSessionDAO
+    session_dao = AgentChatSessionDAO()
+    session = session_dao.get_latest(agent_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No chat session found for this agent",
+        )
+    # Return only what the frontend needs — extract display message from raw JSON
+    history = session.get("history", [])
+
+    def _extract_display(role: str, content: str) -> str:
+        """For assistant messages, extract the 'message' field from raw JSON."""
+        if role == "user":
+            return content
+        import json as _json
+        import re as _re
+        cleaned = _re.sub(r"^```(?:json)?\s*", "", content.strip()).rstrip("`").strip()
+        try:
+            parsed = _json.loads(cleaned)
+            if isinstance(parsed, dict) and "message" in parsed:
+                return parsed["message"]
+        except (ValueError, _json.JSONDecodeError):
+            pass
+        return content
+
+    return {
+        "sessionId": session["sessionId"],
+        "agentId": agent_id,
+        "stage": session.get("stage", "clarifying"),
+        "messages": [
+            {"role": m["role"], "content": _extract_display(m["role"], m["content"])}
+            for m in history
+        ],
+    }
+
+
+# ── PUT /agents/{agent_id}/draft  ────────────────────────────────────────────
+
+@router.put(
+    "/{agent_id}/draft",
+    response_model=AgentResponse,
+    summary="Auto-save agent draft",
+)
+def auto_save_draft(
+    agent_id: str,
+    body: AgentUpdateRequest,
+    current_user_id: CurrentUserId,
+    svc: AgentServiceDep,
+) -> AgentResponse:
+    """
+    Auto-save endpoint for Quip-style continuous saving.
+    Same as PUT /agents/{agentId} but semantically distinct —
+    called by the frontend debounce timer, not by explicit user action.
+    """
+    return svc.update(agent_id, current_user_id, body)  # type: ignore[return-value]

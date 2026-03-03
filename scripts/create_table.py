@@ -30,6 +30,9 @@ ATTRIBUTE_DEFINITIONS = [
     # statusVisibility stores a composite like "PUBLISHED#public"
     {"AttributeName": "statusVisibility", "AttributeType": "S"},
     {"AttributeName": "callCount", "AttributeType": "N"},
+    # GSI-4: runs by triggeredBy user
+    {"AttributeName": "triggeredBy", "AttributeType": "S"},
+    {"AttributeName": "startedAt", "AttributeType": "S"},
 ]
 
 KEY_SCHEMA = [
@@ -54,6 +57,15 @@ GLOBAL_SECONDARY_INDEXES = [
         "KeySchema": [
             {"AttributeName": "statusVisibility", "KeyType": "HASH"},
             {"AttributeName": "callCount", "KeyType": "RANGE"},
+        ],
+        "Projection": {"ProjectionType": "ALL"},
+    },
+    {
+        # GSI-4: runs by user → query(triggeredBy=userId, sort by startedAt)
+        "IndexName": "GSI4_RunsByUser",
+        "KeySchema": [
+            {"AttributeName": "triggeredBy", "KeyType": "HASH"},
+            {"AttributeName": "startedAt", "KeyType": "RANGE"},
         ],
         "Projection": {"ProjectionType": "ALL"},
     },

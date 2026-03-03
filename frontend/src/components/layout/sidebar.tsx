@@ -8,7 +8,6 @@ import {
   LogOut,
   ShoppingBag,
   User,
-  Workflow,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/contexts/auth-context";
@@ -17,7 +16,6 @@ const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/marketplace", label: "Marketplace", icon: ShoppingBag },
   { href: "/agents", label: "My Agents", icon: Bot },
-  { href: "/workflows", label: "Workflows", icon: Workflow },
 ];
 
 export function Sidebar() {

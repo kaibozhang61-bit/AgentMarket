@@ -22,10 +22,11 @@ from pydantic import BaseModel, Field
 class FieldSchema(BaseModel):
     """One field in an Agent's inputSchema or outputSchema."""
     fieldName: str
-    type: str                   # string | number | boolean | list<string> | object
+    type: str                   # string | number | boolean | list<string> | object | array
     required: bool = True
     default: Any = None
     description: str = ""
+    visibility: Literal["public", "private"] = "private"  # blackboard field visibility
 
 
 # ── Step types ────────────────────────────────────────────────────────────────
@@ -38,7 +39,7 @@ class LLMStep(BaseModel):
     systemPrompt: str
     inputSchema: list[FieldSchema] = Field(default_factory=list)
     outputSchema: list[FieldSchema] = Field(default_factory=list)
-    transformMode: str = "auto"
+    readFromBlackboard: list[str] = Field(default_factory=list)  # e.g. ["agent_input.topic", "step_1_output.keywords"]
     inputMapping: dict[str, str] = Field(default_factory=dict)
     missingFieldsResolution: dict[str, Any] = Field(default_factory=dict)
 
@@ -49,7 +50,8 @@ class AgentRefStep(BaseModel):
     order: int
     type: Literal["agent"]
     agentId: str
-    transformMode: str = "auto"
+    outputSchema: list[FieldSchema] = Field(default_factory=list)
+    readFromBlackboard: list[str] = Field(default_factory=list)
     inputMapping: dict[str, str] = Field(default_factory=dict)
     missingFieldsResolution: dict[str, Any] = Field(default_factory=dict)
 
@@ -68,6 +70,7 @@ class AgentCreateRequest(BaseModel):
     outputSchema: list[FieldSchema] = Field(default_factory=list)
     visibility: Literal["public", "private"] = "private"
     toolsRequired: list[str] = Field(default_factory=list)
+    context: dict[str, str] = Field(default_factory=dict)
 
 
 class AgentUpdateRequest(BaseModel):
@@ -79,9 +82,15 @@ class AgentUpdateRequest(BaseModel):
     outputSchema: list[FieldSchema] | None = None
     visibility: Literal["public", "private"] | None = None
     toolsRequired: list[str] | None = None
+    context: dict[str, str] | None = None
 
 
 class AgentTestRequest(BaseModel):
+    input: dict[str, Any]
+
+
+class AgentTestStepRequest(BaseModel):
+    stepId: str
     input: dict[str, Any]
 
 
@@ -99,6 +108,7 @@ class AgentResponse(BaseModel):
     inputSchema: list[dict[str, Any]]
     outputSchema: list[dict[str, Any]]
     toolsRequired: list[str]
+    context: dict[str, Any] = Field(default_factory=dict)
     callCount: int
     lastUsedAt: str | None = None
     createdAt: str
@@ -116,3 +126,17 @@ class AgentListResponse(BaseModel):
 class AgentTestResponse(BaseModel):
     output: dict[str, Any]
     latency_ms: int
+
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+class ValidationIssue(BaseModel):
+    stepId: str
+    field: str
+    issue: str
+    suggestions: list[str]
+
+
+class AgentValidateResponse(BaseModel):
+    compatible: bool
+    issues: list[ValidationIssue]

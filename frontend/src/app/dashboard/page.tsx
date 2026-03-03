@@ -2,24 +2,21 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Bot, Play, Plus, Workflow } from "lucide-react";
+import { Bot, Play, Plus } from "lucide-react";
 import { AppLayout } from "@/components/layout/app-layout";
-import { agentsApi, workflowsApi } from "@/lib/api";
+import { agentsApi } from "@/lib/api";
 import { useAuth } from "@/contexts/auth-context";
-import type { Agent, Workflow } from "@/lib/types";
+import type { Agent } from "@/lib/types";
 
 export default function DashboardPage() {
   const { user } = useAuth();
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([agentsApi.listMine(), workflowsApi.listMine()])
-      .then(([a, w]) => {
-        setAgents(a.agents);
-        setWorkflows(w.workflows);
-      })
+    agentsApi
+      .listMine()
+      .then((r) => setAgents(r.agents))
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
@@ -32,15 +29,14 @@ export default function DashboardPage() {
             Welcome back{user?.username ? `, ${user.username}` : ""}
           </h1>
           <p className="mt-1 text-sm text-neutral-500">
-            Here&apos;s an overview of your agents and workflows.
+            Here&apos;s an overview of your agents.
           </p>
         </div>
 
         {/* Stats */}
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
           {[
             { label: "My Agents", value: agents.length, icon: Bot },
-            { label: "Workflows", value: workflows.length, icon: Workflow },
             {
               label: "Published",
               value: agents.filter((a) => a.status === "published").length,
@@ -71,46 +67,39 @@ export default function DashboardPage() {
             className="flex items-center gap-2 rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-700"
           >
             <Plus className="h-4 w-4" />
-            New Agent
-          </Link>
-          <Link
-            href="/workflows/new"
-            className="flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-50"
-          >
-            <Plus className="h-4 w-4" />
-            New Workflow
+            Create Agent
           </Link>
         </div>
 
-        {/* Recent workflows */}
+        {/* Recent agents */}
         <div>
-          <h2 className="mb-3 text-base font-medium">Recent Workflows</h2>
+          <h2 className="mb-3 text-base font-medium">Recent Agents</h2>
           {loading ? (
             <p className="text-sm text-neutral-400">Loading…</p>
-          ) : workflows.length === 0 ? (
-            <p className="text-sm text-neutral-400">No workflows yet.</p>
+          ) : agents.length === 0 ? (
+            <p className="text-sm text-neutral-400">No agents yet.</p>
           ) : (
             <div className="space-y-2">
-              {workflows.slice(0, 5).map((wf) => (
+              {agents.slice(0, 5).map((a) => (
                 <Link
-                  key={wf.workflowId}
-                  href={`/workflows/${wf.workflowId}`}
+                  key={a.agentId}
+                  href={`/agents/${a.agentId}/edit`}
                   className="flex items-center justify-between rounded-lg border bg-white px-4 py-3 hover:bg-neutral-50"
                 >
                   <div>
-                    <p className="text-sm font-medium">{wf.name}</p>
+                    <p className="text-sm font-medium">{a.name}</p>
                     <p className="text-xs text-neutral-400">
-                      {wf.steps.length} step{wf.steps.length !== 1 ? "s" : ""}
+                      {a.steps.length} step{a.steps.length !== 1 ? "s" : ""} · {a.callCount} calls
                     </p>
                   </div>
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                      wf.status === "active"
+                      a.status === "published"
                         ? "bg-green-50 text-green-700"
                         : "bg-neutral-100 text-neutral-600"
                     }`}
                   >
-                    {wf.status}
+                    {a.status}
                   </span>
                 </Link>
               ))}

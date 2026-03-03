@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
 
     # LLM model IDs (from MVP design: Sonnet for planning, Haiku for transforms)
-    claude_sonnet_model: str = "claude-sonnet-4-6"
+    claude_sonnet_model: str = "claude-sonnet-4-20250514"
     claude_haiku_model: str = "claude-haiku-4-5-20251001"
 
     # ── Orchestrator limits (from MVP design §5) ─────────────────────────────
@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     # ── Agent execution limits (from Incremental 2 §5) ───────────────────────
     agent_max_db_rows: int = 100
     agent_tool_timeout_seconds: int = 30
+
+    # ── Step retry ───────────────────────────────────────────────────────────
+    step_max_retries: int = 2          # max retry attempts per failed step
+    step_retry_delay_seconds: float = 1.0  # delay between retries
 
     # ── CORS ─────────────────────────────────────────────────────────────────
     cors_origins: list[str] = Field(

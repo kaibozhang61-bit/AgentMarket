@@ -3,14 +3,21 @@ AgentDAO
 
 DynamoDB layout:
   PK = AGENT#<agentId>
-  SK = VERSION#<version>          e.g. VERSION#1.0.0
-  SK = RUN#<timestamp>#<runId>    e.g. RUN#2026-02-27T09:00:00Z#run-001
-  SK = SESSION#<timestamp>#<sessionId>  (written by AgentChatSessionDAO)
+  SK = LATEST                             ← current published (or only draft) version
+  SK = DRAFT                              ← work-in-progress edits to a published agent
+  SK = VERSION#<timestamp>                ← archived snapshot (future version history)
+  SK = RUN#<timestamp>#<runId>            ← execution records
+  SK = SESSION#<timestamp>#<sessionId>    ← chat sessions (written by AgentChatSessionDAO)
+
+Referencing agents:
+  Other agents reference by agentId alone. At runtime, the DAO fetches
+  SK=LATEST — always the current live version. No version number in the
+  reference means no fan-out updates when an agent is republished.
 
 GSI usage:
-  GSI1_AuthorByDate      — list_by_author()     query authorId, filter entityType=AGENT
-  GSI2_MarketplaceHotness — list_marketplace()  query statusVisibility="published#public"
-  GSI3_AuthorByLastUsed  — future: list by most recently used
+  GSI1_AuthorByDate       — list_by_author()    query authorId, filter entityType=AGENT
+  GSI2_MarketplaceHotness — list_marketplace()   query statusVisibility="published#public"
+  GSI3_AuthorByLastUsed   — future: list by most recently used
 """
 
 import uuid
@@ -21,7 +28,8 @@ from boto3.dynamodb.conditions import Attr, Key
 
 from app.dao.base import BaseDAO
 
-DEFAULT_VERSION = "1.0.0"
+SK_LATEST = "LATEST"
+SK_DRAFT = "DRAFT"
 
 
 def _now() -> str:
@@ -46,56 +54,48 @@ class AgentDAO(BaseDAO):
         return f"AGENT#{agent_id}"
 
     @staticmethod
-    def _version_sk(version: str) -> str:
-        return f"VERSION#{version}"
-
-    @staticmethod
     def _run_sk(run_id: str, timestamp: str) -> str:
         return f"RUN#{timestamp}#{run_id}"
 
     @staticmethod
+    def _version_sk(timestamp: str) -> str:
+        return f"VERSION#{timestamp}"
+
+    @staticmethod
     def _status_visibility(status: str, visibility: str) -> str:
-        """Composite GSI-2 partition key."""
         return f"{status}#{visibility}"
 
     # ── Write ─────────────────────────────────────────────────────────────────
 
     def create(self, data: dict[str, Any]) -> dict[str, Any]:
         """
-        Create a new Agent draft.
-
-        Required in data: name, authorId, steps (list, at least 1)
-        Optional: description, inputSchema, outputSchema, visibility,
-                  version, toolsRequired, level, tools
+        Create a new Agent with SK=LATEST and status=draft.
         """
         agent_id = str(uuid.uuid4())
-        version = data.get("version", DEFAULT_VERSION)
         visibility = data.get("visibility", "private")
         now = _now()
 
         item: dict[str, Any] = {
             "PK": self._pk(agent_id),
-            "SK": self._version_sk(version),
+            "SK": SK_LATEST,
             "entityType": "AGENT",
             "agentId": agent_id,
-            "version": version,
+            "version": SK_LATEST,
             "name": data["name"],
             "description": data.get("description", ""),
             "authorId": data["authorId"],
             "status": "draft",
             "visibility": visibility,
             "statusVisibility": self._status_visibility("draft", visibility),
-            # steps: always at least 1; stepIds auto-assigned if missing
             "steps": _assign_step_ids(data.get("steps", [])),
-            # top-level schemas for the agent as a whole
             "inputSchema": data.get("inputSchema", []),
             "outputSchema": data.get("outputSchema", []),
             "toolsRequired": data.get("toolsRequired", []),
+            "context": data.get("context", {}),
             "callCount": 0,
             "lastUsedAt": None,
             "createdAt": now,
             "updatedAt": now,
-            # Incremental 2 fields
             "level": data.get("level", "L1"),
             "tools": data.get("tools", []),
         }
@@ -106,15 +106,14 @@ class AgentDAO(BaseDAO):
         return self._clean(item)
 
     def update(
-        self, agent_id: str, version: str, fields: dict[str, Any]
+        self, agent_id: str, sk: str, fields: dict[str, Any]
     ) -> dict[str, Any] | None:
         """
-        Update any subset of Agent fields.
-        Automatically keeps statusVisibility in sync when status or visibility changes.
-        If steps are provided, stepIds are auto-assigned for any step missing one.
+        Update fields on an agent item (LATEST or DRAFT).
+        Keeps statusVisibility in sync. Auto-assigns stepIds.
         """
         if "status" in fields or "visibility" in fields:
-            current = self.get(agent_id, version)
+            current = self._get_by_sk(agent_id, sk)
             if not current:
                 return None
             status = fields.get("status", current["status"])
@@ -127,7 +126,7 @@ class AgentDAO(BaseDAO):
         fields["updatedAt"] = _now()
         expr, names, values = self._build_update_expr(fields)
         resp = self._table.update_item(
-            Key={"PK": self._pk(agent_id), "SK": self._version_sk(version)},
+            Key={"PK": self._pk(agent_id), "SK": sk},
             UpdateExpression=expr,
             ExpressionAttributeNames=names,
             ExpressionAttributeValues=values,
@@ -136,33 +135,121 @@ class AgentDAO(BaseDAO):
         )
         return self._clean(resp["Attributes"])
 
-    def delete(self, agent_id: str, version: str) -> None:
+    def save_draft(self, agent_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        """
+        Save a DRAFT version of a published agent.
+        Creates the DRAFT item if it doesn't exist, or updates it.
+        The LATEST item stays untouched (live for other agents).
+        """
+        existing_draft = self._get_by_sk(agent_id, SK_DRAFT)
+        if existing_draft:
+            return self.update(agent_id, SK_DRAFT, fields)  # type: ignore[return-value]
+
+        # Copy LATEST to DRAFT, then apply fields
+        latest = self.get(agent_id)
+        if not latest:
+            raise ValueError(f"Agent '{agent_id}' not found")
+
+        item = {**latest}
+        item["SK"] = SK_DRAFT
+        item["PK"] = self._pk(agent_id)
+        item["version"] = SK_DRAFT
+        item["status"] = "draft"
+        item["statusVisibility"] = self._status_visibility("draft", item.get("visibility", "private"))
+        item.update(fields)
+        item["updatedAt"] = _now()
+        if "steps" in item:
+            item["steps"] = _assign_step_ids(item["steps"])
+
+        self._table.put_item(Item=item)
+        return self._clean(item)
+
+    def publish_draft(self, agent_id: str) -> dict[str, Any] | None:
+        """
+        Promote DRAFT → LATEST.
+        1. Archive current LATEST as VERSION#<timestamp>
+        2. Copy DRAFT content into LATEST with status=published
+        3. Delete the DRAFT item
+        """
+        latest = self.get(agent_id)
+        draft = self._get_by_sk(agent_id, SK_DRAFT)
+
+        if not latest and not draft:
+            return None
+
+        # If there's a published LATEST, archive it
+        if latest and latest.get("status") == "published":
+            archive = {**latest}
+            archive_ts = latest.get("updatedAt", _now())
+            archive["SK"] = self._version_sk(archive_ts)
+            archive["version"] = archive_ts
+            archive["statusVisibility"] = self._status_visibility("archived", archive.get("visibility", "private"))
+            self._table.put_item(Item=archive)
+
+        # Source is DRAFT if it exists, otherwise LATEST (first publish)
+        source = draft if draft else latest
+        if not source:
+            return None
+
+        now = _now()
+        source["SK"] = SK_LATEST
+        source["PK"] = self._pk(agent_id)
+        source["version"] = SK_LATEST
+        source["status"] = "published"
+        source["visibility"] = "public"
+        source["statusVisibility"] = self._status_visibility("published", "public")
+        source["updatedAt"] = now
+        if "steps" in source:
+            source["steps"] = _assign_step_ids(source["steps"])
+
+        self._table.put_item(Item=source)
+
+        # Clean up DRAFT item
+        if draft:
+            self._table.delete_item(
+                Key={"PK": self._pk(agent_id), "SK": SK_DRAFT}
+            )
+
+        return self._clean(source)
+
+    def delete(self, agent_id: str, sk: str = SK_LATEST) -> None:
         self._table.delete_item(
-            Key={"PK": self._pk(agent_id), "SK": self._version_sk(version)}
+            Key={"PK": self._pk(agent_id), "SK": sk}
         )
 
-    def increment_call_count(self, agent_id: str, version: str) -> None:
-        """Atomic ADD — safe under concurrent executions."""
+    def increment_call_count(self, agent_id: str, sk: str = SK_LATEST) -> None:
         self._table.update_item(
-            Key={"PK": self._pk(agent_id), "SK": self._version_sk(version)},
+            Key={"PK": self._pk(agent_id), "SK": sk},
             UpdateExpression="ADD callCount :one",
             ExpressionAttributeValues={":one": 1},
         )
 
-    def update_last_used(self, agent_id: str, version: str = DEFAULT_VERSION) -> None:
-        """Set lastUsedAt = now(). Called after a successful agent execution."""
+    def update_last_used(self, agent_id: str, sk: str = SK_LATEST) -> None:
         now = _now()
         self._table.update_item(
-            Key={"PK": self._pk(agent_id), "SK": self._version_sk(version)},
+            Key={"PK": self._pk(agent_id), "SK": sk},
             UpdateExpression="SET lastUsedAt = :now, updatedAt = :now",
             ExpressionAttributeValues={":now": now},
         )
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
-    def get(self, agent_id: str, version: str = DEFAULT_VERSION) -> dict[str, Any] | None:
+    def get(self, agent_id: str) -> dict[str, Any] | None:
+        """Get the LATEST version of an agent. This is what other agents reference."""
+        return self._get_by_sk(agent_id, SK_LATEST)
+
+    def get_draft(self, agent_id: str) -> dict[str, Any] | None:
+        """Get the DRAFT version if it exists."""
+        return self._get_by_sk(agent_id, SK_DRAFT)
+
+    def get_latest_or_draft(self, agent_id: str) -> dict[str, Any] | None:
+        """Get DRAFT if it exists, otherwise LATEST. For the author's edit view."""
+        draft = self.get_draft(agent_id)
+        return draft if draft else self.get(agent_id)
+
+    def _get_by_sk(self, agent_id: str, sk: str) -> dict[str, Any] | None:
         resp = self._table.get_item(
-            Key={"PK": self._pk(agent_id), "SK": self._version_sk(version)}
+            Key={"PK": self._pk(agent_id), "SK": sk}
         )
         item = resp.get("Item")
         return self._clean(item) if item else None
@@ -172,7 +259,10 @@ class AgentDAO(BaseDAO):
         resp = self._table.query(
             IndexName="GSI1_AuthorByDate",
             KeyConditionExpression=Key("authorId").eq(author_id),
-            FilterExpression=Attr("entityType").eq("AGENT"),
+            FilterExpression=(
+                Attr("entityType").eq("AGENT")
+                & Attr("SK").eq(SK_LATEST)
+            ),
         )
         return [self._clean(item) for item in resp.get("Items", [])]
 
@@ -227,16 +317,11 @@ class AgentDAO(BaseDAO):
         return [self._clean(item) for item in items]
 
     # ── Runs ──────────────────────────────────────────────────────────────────
-    # SK format: RUN#{timestamp}#{runId}
-    # ISO timestamp sorts lexicographically = chronologically, so newest-first
-    # queries work with ScanIndexForward=False.
 
     def create_run(self, agent_id: str, triggered_by: str) -> dict[str, Any]:
-        """Create a new AGENT_RUN with status=running."""
         run_id = str(uuid.uuid4())
         now = _now()
         sk = self._run_sk(run_id, now)
-
         item: dict[str, Any] = {
             "PK": self._pk(agent_id),
             "SK": sk,
@@ -246,6 +331,7 @@ class AgentDAO(BaseDAO):
             "triggeredBy": triggered_by,
             "status": "running",
             "stepResults": [],
+            "blackboard": {},
             "startedAt": now,
             "finishedAt": None,
         }
@@ -253,7 +339,6 @@ class AgentDAO(BaseDAO):
         return self._clean(item)
 
     def get_run(self, agent_id: str, run_id: str, started_at: str) -> dict[str, Any] | None:
-        """Get a specific run by its composite SK."""
         sk = self._run_sk(run_id, started_at)
         resp = self._table.get_item(
             Key={"PK": self._pk(agent_id), "SK": sk}
@@ -271,7 +356,6 @@ class AgentDAO(BaseDAO):
         finished: bool = False,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Update run status and optionally replace stepResults."""
         sk = self._run_sk(run_id, started_at)
         fields: dict[str, Any] = {"status": status}
         if step_results is not None:
@@ -280,7 +364,6 @@ class AgentDAO(BaseDAO):
             fields["finishedAt"] = _now()
         if extra:
             fields.update(extra)
-
         expr, names, values = self._build_update_expr(fields)
         resp = self._table.update_item(
             Key={"PK": self._pk(agent_id), "SK": sk},
@@ -292,16 +375,24 @@ class AgentDAO(BaseDAO):
         return self._clean(resp["Attributes"])
 
     def get_runs(self, agent_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        """
-        All runs for an agent, newest first.
-        SK begins_with "RUN#" + ScanIndexForward=False gives time-desc order
-        because the timestamp prefix sorts lexicographically.
-        """
         resp = self._table.query(
             KeyConditionExpression=(
                 Key("PK").eq(self._pk(agent_id))
                 & Key("SK").begins_with("RUN#")
             ),
+            ScanIndexForward=False,
+            Limit=limit,
+        )
+        return [self._clean(item) for item in resp.get("Items", [])]
+
+    def get_runs_by_user(
+        self, user_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """GSI4_RunsByUser: all runs triggered by a user, newest first."""
+        resp = self._table.query(
+            IndexName="GSI4_RunsByUser",
+            KeyConditionExpression=Key("triggeredBy").eq(user_id),
+            FilterExpression=Attr("entityType").eq("AGENT_RUN"),
             ScanIndexForward=False,
             Limit=limit,
         )

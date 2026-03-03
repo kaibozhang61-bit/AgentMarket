@@ -1,28 +1,16 @@
 """
-RunService — Workflow execution engine.
+RunService — Agent execution engine with Blackboard Pattern.
 
-Execution model (MVP)
----------------------
-Synchronous, in-process execution inside the HTTP request.
-Steps run sequentially in `order` order.  The three step types behave as:
+Blackboard
+----------
+A shared key-value store per run. Every step reads declared fields from
+the blackboard and writes its output back after execution.
 
-  AGENT   → resolve input templates → invoke Lambda (agent executor)
-             → parse JSON output → increment agent callCount
-  LLM     → resolve prompt template → call Claude Sonnet → return text / JSON
-  LOGIC   → condition : evaluate simple comparison, record branch (linear flow only)
-             transform : pass-through (MVP placeholder)
-             user_input: pause run, persist state, return waiting_user_input
+  agent_input           → the input passed to the agent by the caller
+  step_{stepId}_output  → each step's validated output
 
-Resume flow
------------
-POST /runs/{runId}/resume injects the user's answer as the paused step's output,
-then resumes execution from the next step.
-
-Template syntax
----------------
-  {{context.<key>}}                → workflow.context[key] (after runtime resolution)
-  {{<stepId>.output.<field>}}      → output of a completed prior step
-  {{current_user.id}} / {{now}}    → special context values resolved at run start
+Steps declare which fields they need via `readFromBlackboard`.
+Each step outputs to its own `outputSchema` — no runtime override.
 """
 
 from __future__ import annotations
@@ -39,12 +27,14 @@ from fastapi import HTTPException, status
 
 from app.core.config import get_settings
 from app.dao.agent_dao import AgentDAO
-from app.dao.workflow_dao import WorkflowDAO
-from app.dao.workflow_run_dao import WorkflowRunDAO
 
 _settings = get_settings()
 _llm = anthropic.Anthropic(api_key=_settings.anthropic_api_key)
 _lambda_client = boto3.client("lambda", region_name=_settings.aws_region)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _invoke_agent_lambda(
@@ -54,22 +44,7 @@ def _invoke_agent_lambda(
     output_schema: list,
     input_data: dict,
 ) -> dict[str, Any]:
-    """
-    Invoke the shared agent-executor Lambda synchronously.
-
-    Lambda contract
-    ---------------
-    Input payload:
-      { agentId, version, systemPrompt, outputSchema, input }
-
-    Output payload (success):
-      { "output": { ... } }
-
-    Output payload (agent-level error):
-      { "error": "..." }
-
-    Lambda-level errors (unhandled exceptions) set FunctionError in the response.
-    """
+    """Invoke the shared agent-executor Lambda synchronously."""
     payload_bytes = json.dumps({
         "agentId": agent_id,
         "version": version,
@@ -77,186 +52,250 @@ def _invoke_agent_lambda(
         "outputSchema": output_schema,
         "input": input_data,
     }).encode()
-
     resp = _lambda_client.invoke(
         FunctionName=_settings.lambda_agent_executor_arn,
         InvocationType="RequestResponse",
         Payload=payload_bytes,
     )
-
-    raw = resp["Payload"].read()  # StreamingBody — read once
-
+    raw = resp["Payload"].read()
     if resp.get("FunctionError"):
         err = json.loads(raw)
         raise RuntimeError(f"Lambda error: {err.get('errorMessage', 'unknown')}")
-
     result = json.loads(raw)
     if result.get("error"):
         raise RuntimeError(f"Agent error: {result['error']}")
-
     return result.get("output", {})
+
+
+# ── Blackboard helpers ────────────────────────────────────────────────────────
+
+def _get_nested(blackboard: dict, dot_path: str) -> Any:
+    """
+    Resolve a dot-path reference into the blackboard.
+    e.g. "step_1_output.competitors" → blackboard["step_1_output"]["value"]["competitors"]
+    e.g. "agent_input.topic" → blackboard["agent_input"]["value"]["topic"]
+    """
+    parts = dot_path.split(".", 1)
+    key = parts[0]
+    entry = blackboard.get(key)
+    if not entry:
+        return None
+    value = entry.get("value", {})
+    if len(parts) == 1:
+        return value
+    # Drill into the value dict
+    field = parts[1]
+    if isinstance(value, dict):
+        return value.get(field)
+    return None
+
+
+def _extract_blackboard_fields(
+    blackboard: dict, read_from: list[str],
+) -> dict[str, Any]:
+    """Extract only the declared fields from the blackboard."""
+    fields: dict[str, Any] = {}
+    for path in read_from:
+        val = _get_nested(blackboard, path)
+        if val is not None:
+            fields[path] = val
+    return fields
+
+
+def _validate_output(output: dict, schema: list[dict]) -> list[str]:
+    """
+    Validate output against the step's outputSchema.
+    Returns a list of error messages (empty = valid).
+    Checks: required fields present, basic type matching.
+    """
+    errors: list[str] = []
+    for field in schema:
+        fname = field.get("fieldName", "")
+        required = field.get("required", True)
+        expected_type = field.get("type", "").lower()
+
+        if fname not in output:
+            if required:
+                errors.append(f"Missing required field: {fname}")
+            continue
+
+        val = output[fname]
+
+        # Basic type checks
+        if expected_type in ("string",) and not isinstance(val, str):
+            errors.append(f"Field '{fname}' expected string, got {type(val).__name__}")
+        elif expected_type in ("number", "integer") and not isinstance(val, (int, float)):
+            errors.append(f"Field '{fname}' expected number, got {type(val).__name__}")
+        elif expected_type in ("boolean", "bool") and not isinstance(val, bool):
+            errors.append(f"Field '{fname}' expected boolean, got {type(val).__name__}")
+        elif expected_type in ("array", "list", "list<string>") and not isinstance(val, list):
+            errors.append(f"Field '{fname}' expected array, got {type(val).__name__}")
+        elif expected_type in ("object", "map", "dict") and not isinstance(val, dict):
+            errors.append(f"Field '{fname}' expected object, got {type(val).__name__}")
+
+    return errors
 
 
 class RunService:
 
     def __init__(self) -> None:
-        self._wf_dao = WorkflowDAO()
-        self._run_dao = WorkflowRunDAO()
         self._agent_dao = AgentDAO()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def trigger_run(self, workflow_id: str, triggered_by: str) -> dict[str, Any]:
-        """
-        Validate the workflow, create the run record (status=running), and return
-        immediately.  The caller must schedule execute_run() as a BackgroundTask.
-        """
-        wf = self._get_workflow_or_404(workflow_id)
-        self._assert_owner(wf, triggered_by)
+    def trigger_run(self, agent_id: str, triggered_by: str) -> dict[str, Any]:
+        """Validate the agent, create a run record, return immediately."""
+        agent = self._get_agent_or_404(agent_id)
+        self._assert_owner(agent, triggered_by)
 
-        steps = wf.get("steps", [])
+        steps = agent.get("steps", [])
         if not steps:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Workflow has no steps to execute",
+                detail="Agent has no steps to execute",
             )
         if len(steps) > _settings.orchestrator_max_steps:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Workflow exceeds the maximum step limit ({_settings.orchestrator_max_steps})",
+                detail=f"Agent exceeds the maximum step limit ({_settings.orchestrator_max_steps})",
             )
 
-        return self._run_dao.create(workflow_id, triggered_by)
+        from app.services.agent_service import AgentService
+        validation = AgentService()._run_validation(agent)
+        if not validation["compatible"]:
+            issues_str = "; ".join(
+                f"{i['stepId']}.{i['field']}: {i['issue']}"
+                for i in validation["issues"]
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Agent validation failed: {issues_str}",
+            )
 
-    def execute_run(self, workflow_id: str, run_id: str, triggered_by: str) -> None:
-        """
-        Execute all workflow steps and persist results to DDB.
-        Designed to run inside a FastAPI BackgroundTask (separate thread).
-        Any unhandled exception marks the run as failed.
-        """
+        return self._agent_dao.create_run(agent_id, triggered_by)
+
+    def execute_run(
+        self, agent_id: str, run_id: str, triggered_by: str,
+        agent_input: dict[str, Any] | None = None,
+    ) -> None:
+        """Execute all agent steps with blackboard. Runs inside a BackgroundTask."""
         try:
-            wf = self._wf_dao.get(workflow_id)
-            if not wf:
+            agent = self._agent_dao.get(agent_id)
+            if not agent:
                 return
-            steps = sorted(wf.get("steps", []), key=lambda s: s.get("order", 0))
-            context = self._resolve_context(wf.get("context", {}), triggered_by)
+            run = self._find_run(agent_id, run_id)
+            if not run:
+                return
+            steps = sorted(agent.get("steps", []), key=lambda s: s.get("order", 0))
+            context = self._resolve_context(agent.get("context", {}), triggered_by)
+
+            # Initialize blackboard with agent input
+            blackboard: dict[str, Any] = {}
+            blackboard["agent_input"] = {
+                "value": agent_input or {},
+                "writtenAt": _now(),
+            }
+
             self._execute_steps(
-                workflow_id=workflow_id,
+                agent_id=agent_id,
                 run_id=run_id,
+                started_at=run["startedAt"],
                 steps=steps,
                 context=context,
-                step_outputs={},
+                blackboard=blackboard,
                 existing_results=[],
             )
         except Exception as exc:
             try:
-                self._run_dao.update_status(
-                    workflow_id, run_id, "failed",
-                    finished=True, extra={"fatalError": str(exc)},
-                )
+                run = self._find_run(agent_id, run_id)
+                if run:
+                    self._agent_dao.update_run_status(
+                        agent_id, run_id, run["startedAt"], "failed",
+                        finished=True, extra={"fatalError": str(exc)},
+                    )
             except Exception:
                 pass
 
     def resume_run(
-        self,
-        workflow_id: str,
-        run_id: str,
-        requester_id: str,
-        answer: Any,
+        self, agent_id: str, run_id: str, requester_id: str, answer: Any,
     ) -> dict[str, Any]:
-        """
-        Inject the user's answer into the paused step, flip status back to running,
-        and return immediately.  The caller must schedule continue_run() as a
-        BackgroundTask.
-
-        pendingStepId / pendingStepOrder are left in DDB so continue_run() can
-        read them without an extra argument.
-        """
-        wf = self._get_workflow_or_404(workflow_id)
-        self._assert_owner(wf, requester_id)
-
-        run = self._run_dao.get(workflow_id, run_id)
-        if not run:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Run '{run_id}' not found",
-            )
+        """Inject user answer into paused step, flip to running."""
+        agent = self._get_agent_or_404(agent_id)
+        self._assert_owner(agent, requester_id)
+        run = self._find_run_or_404(agent_id, run_id)
         if run["status"] != "waiting_user_input":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Run is not paused (current status: {run['status']})",
             )
-
         pending_step_id: str = run.get("pendingStepId", "")
-
-        # Mark the paused step as success with the user's answer as output
         step_results: list[dict] = list(run.get("stepResults", []))
         for i, sr in enumerate(step_results):
             if sr.get("stepId") == pending_step_id:
                 output_field: str = sr.get("outputField") or "answer"
                 step_results[i] = {
-                    **sr,
-                    "status": "success",
-                    "output": {output_field: answer},
-                    "pendingQuestion": None,
+                    **sr, "status": "success",
+                    "output": {output_field: answer}, "pendingQuestion": None,
                 }
                 break
-
-        # Flip to running; pendingStepOrder stays in DDB for continue_run to read
-        self._run_dao.update_status(
-            workflow_id, run_id, "running", step_results=step_results
+        self._agent_dao.update_run_status(
+            agent_id, run_id, run["startedAt"], "running",
+            step_results=step_results,
         )
-        return self._run_dao.get(workflow_id, run_id)  # type: ignore[return-value]
+        return self._find_run_or_404(agent_id, run_id)
 
-    def continue_run(self, workflow_id: str, run_id: str, triggered_by: str) -> None:
-        """
-        Continue execution from after the previously paused step.
-        Designed to run inside a FastAPI BackgroundTask (separate thread).
-        Reads pendingStepOrder from the DDB run record written by resume_run().
-        """
+    def continue_run(self, agent_id: str, run_id: str, triggered_by: str) -> None:
+        """Continue from after the paused step."""
         try:
-            wf = self._wf_dao.get(workflow_id)
-            if not wf:
+            agent = self._agent_dao.get(agent_id)
+            if not agent:
                 return
-            run = self._run_dao.get(workflow_id, run_id)
+            run = self._find_run(agent_id, run_id)
             if not run:
                 return
-
             pending_step_order: int = run.get("pendingStepOrder", 0)
-            step_results: list[dict] = list(run.get("stepResults", []))
-            step_outputs: dict[str, dict] = {
-                sr["stepId"]: sr.get("output", {})
-                for sr in step_results
-                if sr.get("status") == "success"
-            }
             remaining = sorted(
-                [s for s in wf["steps"] if s.get("order", 0) > pending_step_order],
+                [s for s in agent["steps"] if s.get("order", 0) > pending_step_order],
                 key=lambda s: s.get("order", 0),
             )
-            context = self._resolve_context(wf.get("context", {}), triggered_by)
+            context = self._resolve_context(agent.get("context", {}), triggered_by)
+            blackboard = run.get("blackboard", {})
             self._execute_steps(
-                workflow_id=workflow_id,
-                run_id=run_id,
-                steps=remaining,
-                context=context,
-                step_outputs=step_outputs,
-                existing_results=step_results,
+                agent_id=agent_id, run_id=run_id, started_at=run["startedAt"],
+                steps=remaining, context=context, blackboard=blackboard,
+                existing_results=list(run.get("stepResults", [])),
             )
         except Exception as exc:
             try:
-                self._run_dao.update_status(
-                    workflow_id, run_id, "failed",
-                    finished=True, extra={"fatalError": str(exc)},
-                )
+                run = self._find_run(agent_id, run_id)
+                if run:
+                    self._agent_dao.update_run_status(
+                        agent_id, run_id, run["startedAt"], "failed",
+                        finished=True, extra={"fatalError": str(exc)},
+                    )
             except Exception:
                 pass
 
-    def get_run(
-        self, workflow_id: str, run_id: str, requester_id: str
-    ) -> dict[str, Any]:
-        wf = self._get_workflow_or_404(workflow_id)
-        self._assert_owner(wf, requester_id)
-        run = self._run_dao.get(workflow_id, run_id)
+    def get_run(self, agent_id: str, run_id: str, requester_id: str) -> dict[str, Any]:
+        agent = self._get_agent_or_404(agent_id)
+        self._assert_owner(agent, requester_id)
+        return self._find_run_or_404(agent_id, run_id)
+
+    def list_runs(self, agent_id: str, requester_id: str, limit: int = 20) -> dict[str, Any]:
+        agent = self._get_agent_or_404(agent_id)
+        self._assert_owner(agent, requester_id)
+        all_runs = self._agent_dao.get_runs(agent_id, limit=limit)
+        runs = [r for r in all_runs if r.get("triggeredBy") == requester_id]
+        return {"runs": runs, "total": len(runs)}
+
+    # ── Run lookup helpers ────────────────────────────────────────────────────
+
+    def _find_run(self, agent_id: str, run_id: str) -> dict[str, Any] | None:
+        runs = self._agent_dao.get_runs(agent_id, limit=50)
+        return next((r for r in runs if r.get("runId") == run_id), None)
+
+    def _find_run_or_404(self, agent_id: str, run_id: str) -> dict[str, Any]:
+        run = self._find_run(agent_id, run_id)
         if not run:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -264,144 +303,170 @@ class RunService:
             )
         return run
 
-    def list_runs(
-        self, workflow_id: str, requester_id: str, limit: int = 20
-    ) -> dict[str, Any]:
-        wf = self._get_workflow_or_404(workflow_id)
-        self._assert_owner(wf, requester_id)
-        runs, _ = self._run_dao.list_by_workflow(workflow_id, limit=limit)
-        return {"runs": runs, "total": len(runs)}
-
-    # ── Core execution loop ───────────────────────────────────────────────────
+    # ── Core execution loop (Blackboard Pattern) ──────────────────────────────
 
     def _execute_steps(
         self,
-        workflow_id: str,
+        agent_id: str,
         run_id: str,
+        started_at: str,
         steps: list[dict],
         context: dict,
-        step_outputs: dict[str, dict],
+        blackboard: dict[str, Any],
         existing_results: list[dict],
     ) -> dict[str, Any]:
-        """
-        Run `steps` sequentially, persisting results and terminal state to DDB.
-        `existing_results` contains already-completed step results (for resume).
-        Returns the final run item from DDB.
-        """
         all_results: list[dict] = list(existing_results)
+
+        # Persist initial blackboard state
+        self._save_blackboard(agent_id, run_id, started_at, blackboard)
 
         for step in steps:
             t0 = time.monotonic()
 
-            try:
-                result = self._execute_single_step(step, context, step_outputs)
-            except Exception as exc:
-                result = {
-                    "stepId": step.get("stepId", ""),
-                    "type": step.get("type", ""),
-                    "status": "failed",
-                    "error": str(exc),
-                    "input": {},
-                    "output": {},
-                }
+            # 1. Extract declared fields from blackboard
+            read_from = step.get("readFromBlackboard", [])
+            bb_fields = _extract_blackboard_fields(blackboard, read_from)
 
+            # 2. Get the step's own outputSchema
+            output_schema = step.get("outputSchema", [])
+
+            # 3. Execute with retry
+            max_retries = _settings.step_max_retries
+            last_error: str = ""
+            result: dict[str, Any] | None = None
+
+            for attempt in range(1 + max_retries):
+                try:
+                    result = self._execute_single_step(
+                        step, context, bb_fields, output_schema,
+                    )
+                    if result["status"] != "failed":
+                        break
+                    last_error = result.get("error", "")
+                except Exception as exc:
+                    last_error = str(exc)
+                    result = {
+                        "stepId": step.get("stepId", ""),
+                        "type": step.get("type", ""),
+                        "status": "failed",
+                        "error": last_error,
+                        "input": {},
+                        "output": {},
+                    }
+                if attempt < max_retries:
+                    time.sleep(_settings.step_retry_delay_seconds)
+
+            assert result is not None
             result["latency_ms"] = int((time.monotonic() - t0) * 1000)
             all_results.append(result)
 
-            step_status: str = result["status"]
-
-            if step_status == "failed":
-                self._run_dao.update_status(
-                    workflow_id, run_id, "failed",
+            if result["status"] == "failed":
+                self._agent_dao.update_run_status(
+                    agent_id, run_id, started_at, "failed",
                     step_results=all_results, finished=True,
+                    extra={"blackboard": blackboard},
                 )
-                return self._run_dao.get(workflow_id, run_id)  # type: ignore[return-value]
+                return self._find_run_or_404(agent_id, run_id)
 
-            if step_status == "waiting_user_input":
-                self._run_dao.update_status(
-                    workflow_id, run_id, "waiting_user_input",
+            if result["status"] == "waiting_user_input":
+                self._agent_dao.update_run_status(
+                    agent_id, run_id, started_at, "waiting_user_input",
                     step_results=all_results,
                     extra={
                         "pendingStepId": step.get("stepId", ""),
                         "pendingStepOrder": step.get("order", 0),
+                        "blackboard": blackboard,
                     },
                 )
-                return self._run_dao.get(workflow_id, run_id)  # type: ignore[return-value]
+                return self._find_run_or_404(agent_id, run_id)
 
-            # Step succeeded — make output available to downstream steps
-            step_outputs[step["stepId"]] = result.get("output", {})
+            # 4. Validate output against step's own outputSchema
+            output = result.get("output", {})
+            if output_schema:
+                errors = _validate_output(output, output_schema)
+                if errors:
+                    result["validationWarnings"] = errors
+                    # Don't fail — just warn. Output still written to blackboard.
 
-        # All steps finished successfully
-        self._run_dao.update_status(
-            workflow_id, run_id, "success",
+            # 5. Write to blackboard
+            step_id = step.get("stepId", "")
+            bb_key = f"step_{step_id}_output"
+            bb_entry: dict[str, Any] = {
+                "value": output,
+                "writtenBy": step_id,
+                "writtenAt": _now(),
+            }
+            # For agent steps, include public blackboard from inner execution
+            if result.get("publicBlackboard"):
+                bb_entry["publicBlackboard"] = result["publicBlackboard"]
+            blackboard[bb_key] = bb_entry
+
+            # 6. Persist blackboard after each step
+            self._save_blackboard(agent_id, run_id, started_at, blackboard)
+
+        # All steps done
+        self._agent_dao.update_run_status(
+            agent_id, run_id, started_at, "success",
             step_results=all_results, finished=True,
+            extra={"blackboard": blackboard},
         )
-        return self._run_dao.get(workflow_id, run_id)  # type: ignore[return-value]
+        try:
+            self._agent_dao.update_last_used(agent_id)
+        except Exception:
+            pass
+        return self._find_run_or_404(agent_id, run_id)
+
+    def _save_blackboard(
+        self, agent_id: str, run_id: str, started_at: str, blackboard: dict,
+    ) -> None:
+        """Persist the current blackboard state to the run record."""
+        self._agent_dao.update_run_status(
+            agent_id, run_id, started_at, "running",
+            extra={"blackboard": blackboard},
+        )
 
     def _execute_single_step(
-        self, step: dict, context: dict, step_outputs: dict
+        self, step: dict, context: dict, bb_fields: dict[str, Any],
+        output_schema: list[dict],
     ) -> dict[str, Any]:
-        step_type = step.get("type", "")
-        if step_type == "AGENT":
-            return self._exec_agent(step, context, step_outputs)
-        if step_type == "LLM":
-            return self._exec_llm(step, context, step_outputs)
-        if step_type == "LOGIC":
-            return self._exec_logic(step, context, step_outputs)
+        step_type = step.get("type", "").lower()
+        if step_type == "llm":
+            return self._exec_llm(step, context, bb_fields, output_schema)
+        if step_type == "agent":
+            return self._exec_agent(step, context, bb_fields, output_schema)
         raise ValueError(f"Unknown step type: {step_type!r}")
 
     # ── Step executors ────────────────────────────────────────────────────────
 
-    def _exec_agent(
-        self, step: dict, context: dict, step_outputs: dict
-    ) -> dict[str, Any]:
-        agent_id: str = step["agentId"]
-        agent_version: str = step.get("agentVersion", "1.0.0")
-
-        agent = self._agent_dao.get(agent_id, agent_version)
-        if not agent:
-            raise ValueError(f"Agent '{agent_id}' v{agent_version} not found")
-
-        input_data = self._resolve_agent_input(step, agent, context, step_outputs)
-
-        output = _invoke_agent_lambda(
-            agent_id=agent_id,
-            version=agent_version,
-            system_prompt=agent.get("systemPrompt", ""),
-            output_schema=agent.get("outputSchema", []),
-            input_data=input_data,
-        )
-
-        # Best-effort callCount increment (non-critical)
-        try:
-            self._agent_dao.increment_call_count(agent_id, agent_version)
-        except Exception:
-            pass
-
-        return {
-            "stepId": step["stepId"],
-            "type": "AGENT",
-            "status": "success",
-            "input": input_data,
-            "output": output,
-            "error": None,
-        }
-
     def _exec_llm(
-        self, step: dict, context: dict, step_outputs: dict
+        self, step: dict, context: dict, bb_fields: dict[str, Any],
+        output_schema: list[dict],
     ) -> dict[str, Any]:
-        prompt = self._resolve_template(step.get("prompt", ""), context, step_outputs)
-        output_schema: dict | None = step.get("outputSchema")
+        prompt = step.get("systemPrompt", "") or step.get("prompt", "")
+
+        # Build user message from blackboard fields
+        if bb_fields:
+            user_content = json.dumps(bb_fields, ensure_ascii=False, indent=2)
+        else:
+            user_content = "No input provided."
 
         kwargs: dict[str, Any] = {
             "model": _settings.claude_sonnet_model,
             "max_tokens": 2048,
-            "messages": [{"role": "user", "content": prompt}],
+            "system": prompt,
+            "messages": [{"role": "user", "content": user_content}],
         }
-        if output_schema and isinstance(output_schema, dict) and "fieldName" in output_schema:
-            hint = {output_schema["fieldName"]: output_schema.get("type", "string")}
+
+        # Tell LLM to output in the step's own outputSchema format
+        if output_schema and isinstance(output_schema, list) and output_schema:
+            hint = {
+                f.get("fieldName", "result"): f.get("type", "string")
+                for f in output_schema
+            }
             kwargs["system"] = (
-                f"Respond with valid JSON: {json.dumps(hint, ensure_ascii=False)}"
+                f"{prompt}\n\n"
+                f"Respond with valid JSON matching this schema: "
+                f"{json.dumps(hint, ensure_ascii=False)}"
             )
 
         resp = _llm.messages.create(**kwargs)
@@ -417,69 +482,74 @@ class RunService:
 
         return {
             "stepId": step["stepId"],
-            "type": "LLM",
+            "type": "llm",
             "status": "success",
-            "input": {"prompt": prompt},
+            "input": bb_fields,
             "output": output,
             "error": None,
         }
 
-    def _exec_logic(
-        self, step: dict, context: dict, step_outputs: dict
+    def _exec_agent(
+        self, step: dict, context: dict, bb_fields: dict[str, Any],
+        output_schema: list[dict],
     ) -> dict[str, Any]:
-        logic_type: str = step.get("logicType", "condition")
+        ref_agent_id: str = step["agentId"]
+        ref_agent = self._agent_dao.get(ref_agent_id)
+        if not ref_agent:
+            raise ValueError(f"Referenced agent '{ref_agent_id}' not found")
 
-        # ── user_input: pause and wait ────────────────────────────────────────
-        if logic_type == "user_input":
-            return {
-                "stepId": step["stepId"],
-                "type": "LOGIC",
-                "status": "waiting_user_input",
-                "pendingQuestion": step.get("question") or "Please provide input",
-                "outputField": step.get("outputField") or "answer",
-                "input": {},
-                "output": {},
-                "error": None,
-            }
+        ref_steps = ref_agent.get("steps", [])
+        llm_step = next((s for s in ref_steps if s.get("type") == "llm"), None)
+        system_prompt = llm_step.get("systemPrompt", "") if llm_step else ""
 
-        # ── condition: evaluate and record branch (linear flow for MVP) ───────
-        if logic_type == "condition":
-            condition: dict = step.get("condition") or {}
-            raw_expr: str = condition.get("if", "")
-            resolved_expr = self._resolve_template(raw_expr, context, step_outputs)
-            branch_taken = self._eval_condition(resolved_expr)
-            return {
-                "stepId": step["stepId"],
-                "type": "LOGIC",
-                "status": "success",
-                "input": {"condition": raw_expr, "resolved": resolved_expr},
-                "output": {
-                    "result": branch_taken,
-                    "branch": "then" if branch_taken else "else",
-                    "nextStep": condition.get("then") if branch_taken else condition.get("else"),
-                },
-                "error": None,
-            }
+        # Build input from blackboard fields mapped to the agent's inputSchema
+        input_data: dict[str, Any] = {}
+        for field in ref_agent.get("inputSchema", []):
+            fname = field["fieldName"]
+            # Check if any blackboard field matches this input field name
+            for bb_path, bb_val in bb_fields.items():
+                if bb_path.endswith(f".{fname}") or bb_path == fname:
+                    input_data[fname] = bb_val
+                    break
+            if fname not in input_data and field.get("default") is not None:
+                input_data[fname] = field["default"]
 
-        # ── transform: pass-through placeholder for MVP ───────────────────────
+        # Use the step's own outputSchema for the agent call
+        effective_schema = output_schema or ref_agent.get("outputSchema", [])
+
+        output = _invoke_agent_lambda(
+            agent_id=ref_agent_id,
+            version=ref_agent.get("version", "LATEST"),
+            system_prompt=system_prompt,
+            output_schema=effective_schema,
+            input_data=input_data,
+        )
+
+        # Collect public fields from the referenced agent's outputSchema
+        public_blackboard: dict[str, Any] = {}
+        for field in ref_agent.get("outputSchema", []):
+            if field.get("visibility") == "public" and field["fieldName"] in output:
+                public_blackboard[field["fieldName"]] = output[field["fieldName"]]
+
+        try:
+            self._agent_dao.increment_call_count(ref_agent_id)
+            self._agent_dao.update_last_used(ref_agent_id)
+        except Exception:
+            pass
+
         return {
             "stepId": step["stepId"],
-            "type": "LOGIC",
+            "type": "agent",
             "status": "success",
-            "input": {},
-            "output": {},
+            "input": input_data,
+            "output": output,
+            "publicBlackboard": public_blackboard,
             "error": None,
         }
 
-    # ── Template resolution ───────────────────────────────────────────────────
+    # ── Context resolution ────────────────────────────────────────────────────
 
     def _resolve_context(self, context_template: dict, triggered_by: str) -> dict:
-        """
-        Resolve special runtime references in workflow context values:
-          {{current_user.id}}  →  the userId who triggered the run
-          {{now}}              →  ISO-8601 timestamp at run start
-        All other values are treated as literal strings.
-        """
         now = datetime.now(timezone.utc).isoformat()
         resolved: dict[str, Any] = {}
         for key, val in context_template.items():
@@ -491,118 +561,21 @@ class RunService:
                 resolved[key] = val
         return resolved
 
-    def _resolve_template(
-        self, template: str, context: dict, step_outputs: dict
-    ) -> str:
-        """
-        Replace every {{...}} reference in `template` with its resolved value.
-
-        Supported references:
-          {{context.<key>}}              — workflow context value
-          {{<stepId>.output.<field>}}    — output field of a completed step
-        Unrecognised references are left as-is.
-        """
-        def _replace(m: re.Match) -> str:  # type: ignore[type-arg]
-            ref = m.group(1).strip()
-            parts = ref.split(".")
-
-            if parts[0] == "context" and len(parts) >= 2:
-                val: Any = context.get(parts[1], "")
-            elif len(parts) >= 3 and parts[1] == "output":
-                val = step_outputs.get(parts[0], {}).get(parts[2], "")
-            else:
-                return m.group(0)  # leave unrecognised references intact
-
-            if isinstance(val, (dict, list)):
-                return json.dumps(val, ensure_ascii=False)
-            return str(val)
-
-        return re.sub(r"\{\{([^}]+)\}\}", _replace, template)
-
-    def _resolve_agent_input(
-        self,
-        step: dict,
-        agent: dict,
-        context: dict,
-        step_outputs: dict,
-    ) -> dict[str, Any]:
-        """
-        Build the concrete input dict for an AGENT step by resolving inputMapping
-        and missingFieldsResolution against the available context and step outputs.
-        """
-        input_mapping: dict = step.get("inputMapping", {})
-        missing_resolution: dict = step.get("missingFieldsResolution", {})
-        result: dict[str, Any] = {}
-
-        for field in agent.get("inputSchema", []):
-            fname: str = field["fieldName"]
-            default = field.get("default")
-
-            if fname in input_mapping:
-                tpl = input_mapping[fname]
-                result[fname] = (
-                    default
-                    if tpl == "{{default}}"
-                    else self._resolve_template(tpl, context, step_outputs)
-                )
-            elif fname in missing_resolution:
-                res = missing_resolution[fname]
-                result[fname] = self._resolve_template(
-                    res["value"] if isinstance(res, dict) else res.value,
-                    context, step_outputs,
-                )
-            elif default is not None:
-                result[fname] = default
-            # Required fields with no resolution are silently omitted here;
-            # the /validate endpoint should surface them before execution.
-
-        return result
-
-    # ── Condition evaluator ───────────────────────────────────────────────────
-
-    def _eval_condition(self, expr: str) -> bool:
-        """
-        Evaluate a simple binary comparison (>, <, >=, <=, ==, !=).
-        The expression must already have {{...}} references resolved.
-
-        Examples:  "1.2 > 0.8"   →  True
-                   "done == done" →  True
-        """
-        for op in (">=", "<=", "!=", "==", ">", "<"):
-            if op in expr:
-                left_s, right_s = expr.split(op, 1)
-                left_s = left_s.strip()
-                right_s = right_s.strip()
-                try:
-                    left: Any = float(left_s)
-                    right: Any = float(right_s)
-                except ValueError:
-                    left = left_s.strip("'\"")
-                    right = right_s.strip("'\"")
-                match op:
-                    case ">=": return left >= right
-                    case "<=": return left <= right
-                    case "!=": return left != right
-                    case "==": return left == right
-                    case ">":  return left > right
-                    case "<":  return left < right
-        return False
-
     # ── Auth helpers ──────────────────────────────────────────────────────────
 
-    def _get_workflow_or_404(self, workflow_id: str) -> dict[str, Any]:
-        wf = self._wf_dao.get(workflow_id)
-        if not wf:
+    def _get_agent_or_404(self, agent_id: str) -> dict[str, Any]:
+        agent = self._agent_dao.get(agent_id)
+        if not agent:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Workflow '{workflow_id}' not found",
+                detail=f"Agent '{agent_id}' not found",
             )
-        return wf
+        return agent
 
     @staticmethod
-    def _assert_owner(wf: dict[str, Any], requester_id: str) -> None:
-        if wf["authorId"] != requester_id:
+    def _assert_owner(agent: dict[str, Any], requester_id: str) -> None:
+        if agent["authorId"] != requester_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not own this workflow",
+                detail="You do not own this agent",
             )
