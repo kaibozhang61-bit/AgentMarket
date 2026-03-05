@@ -26,7 +26,7 @@ class FieldSchema(BaseModel):
     required: bool = True
     default: Any = None
     description: str = ""
-    visibility: Literal["public", "private"] = "private"  # blackboard field visibility
+    visibility: Literal["public", "private"] = "public"  # blackboard field visibility
 
 
 # ── Step types ────────────────────────────────────────────────────────────────
@@ -56,8 +56,51 @@ class AgentRefStep(BaseModel):
     missingFieldsResolution: dict[str, Any] = Field(default_factory=dict)
 
 
+class ConditionConfig(BaseModel):
+    """Configuration for a condition (Choice State) step."""
+    field: str                  # dot-path to the field to evaluate
+    threshold: float            # numeric threshold
+    then: str                   # stepId to jump to if condition is true
+    else_: str = Field(alias="else", default="")  # stepId if false
+
+
+class TransformConfig(BaseModel):
+    """One transform operation within a transform step."""
+    output_field: str
+    method: Literal["static", "llm", "regex", "template"]
+    value: Any = None           # for static
+    from_field: str = ""        # for llm, regex
+    prompt: str = ""            # for llm
+    pattern: str = ""           # for regex
+    template: str = ""          # for template
+
+
+class LogicStep(BaseModel):
+    """
+    A logic step — condition branching, field transform, or user input pause.
+
+    Maps to Step Functions states:
+      logicType=condition  → Choice State (native, zero latency)
+      logicType=transform  → Task State → execute_transform_lambda
+      logicType=user_input → Task State → user_input_lambda (WaitForTaskToken)
+    """
+    stepId: str = ""
+    order: int
+    type: Literal["logic"]
+    logicType: Literal["condition", "transform", "user_input"]
+    # condition fields
+    condition: ConditionConfig | None = None
+    # transform fields
+    transforms: list[TransformConfig] = Field(default_factory=list)
+    # user_input fields
+    question: str = ""
+    # shared
+    outputSchema: list[FieldSchema] = Field(default_factory=list)
+    readFromBlackboard: list[str] = Field(default_factory=list)
+
+
 # Discriminated union — Pydantic picks the right model based on "type" field
-Step = Annotated[Union[LLMStep, AgentRefStep], Field(discriminator="type")]
+Step = Annotated[Union[LLMStep, AgentRefStep, LogicStep], Field(discriminator="type")]
 
 
 # ── Request bodies ────────────────────────────────────────────────────────────

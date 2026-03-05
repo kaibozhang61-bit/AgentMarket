@@ -174,6 +174,26 @@ def publish_agent(
     return svc.publish(agent_id, current_user_id)  # type: ignore[return-value]
 
 
+# ── POST /agents/{agent_id}/verify-publish  ──────────────────────────────────
+
+@router.post(
+    "/{agent_id}/verify-publish",
+    status_code=status.HTTP_200_OK,
+    summary="LLM-verify then publish",
+)
+def verify_publish_agent(
+    agent_id: str,
+    current_user_id: CurrentUserId,
+    svc: AgentServiceDep,
+) -> dict:
+    """
+    LLM reviews the agent for issues before publishing.
+    If safe, publishes automatically. If concerns found, returns them
+    without publishing — user can fix and reverify or override.
+    """
+    return svc.verify_for_publish(agent_id, current_user_id)
+
+
 # ── POST /agents/{agent_id}/test  ────────────────────────────────────────────
 
 @router.post(

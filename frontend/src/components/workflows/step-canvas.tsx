@@ -1,43 +1,41 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import {
+  ReactFlow,
+  Background,
+  Controls,
+  MiniMap,
+  type Node,
+  type Edge,
+  type NodeTypes,
+  type NodeProps,
+  Handle,
+  Position,
+  useNodesState,
+  useEdgesState,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import type { FieldSchema, WorkflowStep } from "@/lib/types";
+
+/* ── Exported IDs ────────────────────────────────────────────────────────── */
+
+export const AGENT_FRAME_ID = "__agent__";
+export const BLACKBOARD_ID = "__blackboard__";
+
+/* ── Props ───────────────────────────────────────────────────────────────── */
 
 interface Props {
   steps: WorkflowStep[];
   agentName?: string;
   agentInputSchema?: FieldSchema[];
+  agentOutputSchema?: FieldSchema[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   onStepsReordered?: (reordered: WorkflowStep[]) => void;
 }
 
-const AGENT_FRAME_ID = "__agent__";
-const BLACKBOARD_ID = "__blackboard__";
-
-export { AGENT_FRAME_ID, BLACKBOARD_ID };
-
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
-
-const TYPE_STYLE: Record<string, { border: string; bg: string; text: string; dot: string }> = {
-  llm:   { border: "border-purple-200", bg: "bg-purple-50", text: "text-purple-700", dot: "bg-purple-600" },
-  LLM:   { border: "border-purple-200", bg: "bg-purple-50", text: "text-purple-700", dot: "bg-purple-600" },
-  agent: { border: "border-blue-200",   bg: "bg-blue-50",   text: "text-blue-700",   dot: "bg-blue-600" },
-  AGENT: { border: "border-blue-200",   bg: "bg-blue-50",   text: "text-blue-700",   dot: "bg-blue-600" },
-};
-const DEFAULT_STYLE = { border: "border-neutral-200", bg: "bg-neutral-50", text: "text-neutral-700", dot: "bg-neutral-600" };
-
-function getStyle(type: string) { return TYPE_STYLE[type] ?? DEFAULT_STYLE; }
-
-function stepTitle(step: WorkflowStep): string {
-  const t = step.type.toUpperCase();
-  if (t === "AGENT") return step.agentId ? `Agent: ${step.agentId.slice(0, 12)}...` : "Marketplace Agent";
-  if (t === "LLM") {
-    const p = step.prompt ?? step.systemPrompt ?? "";
-    return p.length > 35 ? p.slice(0, 35) + "..." : p || "LLM Step";
-  }
-  return step.type;
-}
 
 function outputFields(schema: unknown): { name: string; vis: string }[] {
   if (!Array.isArray(schema)) return [];
@@ -47,38 +45,305 @@ function outputFields(schema: unknown): { name: string; vis: string }[] {
   }));
 }
 
-/* ── Canvas Component ────────────────────────────────────────────────────── */
+function stepTitle(step: WorkflowStep): string {
+  const t = step.type.toUpperCase();
+  if (t === "AGENT") return step.agentId ? `Agent: ${step.agentId.slice(0, 14)}` : "Marketplace Agent";
+  const p = step.prompt ?? step.systemPrompt ?? "";
+  return p.length > 40 ? p.slice(0, 40) + "..." : p || "LLM Step";
+}
 
-export function StepCanvas({ steps, agentName, agentInputSchema, selectedId, onSelect, onStepsReordered }: Props) {
-  const sorted = [...steps].sort((a, b) => a.order - b.order);
+/* ── Custom node: Step card ──────────────────────────────────────────────── */
 
-  // Pan & zoom
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [zoom, setZoom] = useState(1);
-  const isDragging = useRef(false);
-  const dragStart = useRef({ x: 0, y: 0 });
+function StepNode({ data }: NodeProps) {
+  const d = data as {
+    label: string; idx: number; type: string; readCount: number;
+    writeCount: number; selected: boolean; onSelect: () => void;
+  };
+  const isLlm = d.type.toLowerCase() === "llm";
+  const dotColor = isLlm ? "bg-purple-600" : "bg-blue-600";
+  const badgeBg = isLlm ? "bg-purple-50 text-purple-700" : "bg-blue-50 text-blue-700";
 
-  // Card drag-to-reorder
-  const [draggedIdx, setDraggedIdx] = useState<number | null>(null);
-  const [dropTargetIdx, setDropTargetIdx] = useState<number | null>(null);
+  return (
+    <div
+      onClick={(e) => { e.stopPropagation(); d.onSelect(); }}
+      className={`w-48 rounded-xl border-2 bg-white p-3.5 shadow-sm transition-all cursor-pointer ${
+        d.selected ? "border-neutral-800 shadow-xl ring-2 ring-neutral-200" : "border-neutral-200 hover:shadow-md"
+      }`}
+    >
+      <Handle type="target" position={Position.Left} className="!bg-neutral-300 !w-2 !h-2" />
+      <Handle type="source" position={Position.Right} className="!bg-neutral-300 !w-2 !h-2" />
+      <Handle id="bb" type="source" position={Position.Top} className="!bg-amber-400 !w-2 !h-2" />
 
-  const onMouseDown = useCallback((e: React.MouseEvent) => {
-    if (e.button === 1 || e.target === containerRef.current) {
-      e.preventDefault();
-      isDragging.current = true;
-      dragStart.current = { x: e.clientX - pan.x, y: e.clientY - pan.y };
+      <div className="mb-2 flex items-center gap-2">
+        <div className={`flex h-6 w-6 items-center justify-center rounded-full ${dotColor} text-xs font-bold text-white`}>
+          {d.idx}
+        </div>
+        <span className={`rounded-md px-2 py-0.5 text-xs font-semibold ${badgeBg}`}>
+          {d.type.toUpperCase()}
+        </span>
+      </div>
+      <p className="text-xs text-neutral-600 line-clamp-2">{d.label}</p>
+      {d.readCount > 0 && (
+        <div className="mt-2 flex items-center gap-1 rounded-md bg-blue-50 px-2 py-0.5">
+          <span className="text-xs text-blue-400">&larr;</span>
+          <span className="text-xs text-blue-600">reads {d.readCount} field{d.readCount !== 1 ? "s" : ""}</span>
+        </div>
+      )}
+      {d.writeCount > 0 && (
+        <div className="mt-1 flex items-center gap-1 rounded-md bg-amber-50 px-2 py-0.5">
+          <span className="text-xs text-amber-400">&rarr;</span>
+          <span className="text-xs text-amber-600">writes {d.writeCount} field{d.writeCount !== 1 ? "s" : ""}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Custom node: Blackboard ─────────────────────────────────────────────── */
+
+function BlackboardNode({ data }: NodeProps) {
+  const d = data as {
+    agentName: string;
+    stepCount: number;
+    inputFields: { name: string; type: string }[];
+    agentOutputFields: { name: string; type: string }[];
+    stepGroups: { idx: number; fields: { name: string; vis: string }[] }[];
+    selected: boolean; onSelect: () => void;
+  };
+
+  return (
+    <div
+      onClick={(e) => { e.stopPropagation(); d.onSelect(); }}
+      className={`min-w-[300px] cursor-pointer rounded-xl border-2 bg-white p-4 shadow-sm transition-all ${
+        d.selected ? "border-amber-400 shadow-lg" : "border-neutral-200 hover:shadow-md"
+      }`}
+    >
+      <Handle type="target" position={Position.Bottom} className="!bg-amber-400 !w-2 !h-2" />
+
+      {/* Agent header */}
+      <div className="mb-3 flex items-center gap-3 border-b pb-3">
+        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-neutral-900 text-sm font-bold text-white">A</div>
+        <div>
+          <p className="text-sm font-semibold text-neutral-800">{d.agentName}</p>
+          <p className="text-xs text-neutral-400">{d.stepCount} step{d.stepCount !== 1 ? "s" : ""}</p>
+        </div>
+      </div>
+
+      {/* Blackboard section */}
+      <div className="mb-2 flex items-center gap-2">
+        <div className="flex h-5 w-5 items-center justify-center rounded-md bg-amber-500 text-xs font-bold text-white">B</div>
+        <span className="text-xs font-semibold text-amber-800">Blackboard</span>
+      </div>
+
+      <div className="space-y-2">
+        {/* Agent I/O group */}
+        {(d.inputFields.length > 0 || d.agentOutputFields.length > 0) && (
+          <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-2.5">
+            <p className="mb-1.5 text-xs font-semibold text-neutral-500">Agent I/O</p>
+            {d.inputFields.length > 0 && (
+              <div className="mb-1.5">
+                <p className="mb-0.5 text-xs text-neutral-400">Input</p>
+                {d.inputFields.map((f) => (
+                  <p key={f.name} className="text-xs text-neutral-600 pl-1">
+                    <span>&#x1F4E5;</span> <code>{f.name}</code> <span className="text-neutral-300">{f.type}</span>
+                  </p>
+                ))}
+              </div>
+            )}
+            {d.agentOutputFields.length > 0 && (
+              <div>
+                <p className="mb-0.5 text-xs text-neutral-400">Output</p>
+                {d.agentOutputFields.map((f) => (
+                  <p key={f.name} className="text-xs text-neutral-600 pl-1">
+                    <span>&#x1F4E4;</span> <code>{f.name}</code> <span className="text-neutral-300">{f.type}</span>
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Step outputs group */}
+        {d.stepGroups.some((g) => g.fields.length > 0) && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50/30 p-2.5">
+            <p className="mb-1.5 text-xs font-semibold text-amber-600">Step Outputs</p>
+            <div className="space-y-1.5">
+              {d.stepGroups.map((g) => g.fields.length > 0 && (
+                <div key={g.idx}>
+                  <p className="text-xs text-amber-500">Step {g.idx}</p>
+                  {g.fields.map((f) => (
+                    <p key={f.name} className="text-xs text-neutral-600 pl-1">
+                      {f.vis === "public" ? "\uD83C\uDF10" : "\uD83D\uDD12"} <code>{f.name}</code>
+                    </p>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {d.inputFields.length === 0 && d.agentOutputFields.length === 0 && d.stepGroups.every((g) => g.fields.length === 0) && (
+          <p className="py-1 text-xs text-neutral-400">No fields yet</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Custom node: Agent frame (just a label) ─────────────────────────────── */
+
+function AgentLabelNode({ data }: NodeProps) {
+  const d = data as { name: string; stepCount: number; selected: boolean; onSelect: () => void };
+  return (
+    <div
+      onClick={(e) => { e.stopPropagation(); d.onSelect(); }}
+      className={`cursor-pointer rounded-xl border-2 px-5 py-3 transition-all ${
+        d.selected ? "border-blue-400 bg-blue-50/30 shadow-md" : "border-neutral-200 bg-white/80 hover:border-neutral-300"
+      }`}
+    >
+      <div className="flex items-center gap-3">
+        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-neutral-900 text-sm font-bold text-white">A</div>
+        <div>
+          <p className="text-sm font-semibold text-neutral-800">{d.name || "Untitled Agent"}</p>
+          <p className="text-xs text-neutral-400">{d.stepCount} step{d.stepCount !== 1 ? "s" : ""}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Node types registry ─────────────────────────────────────────────────── */
+
+const nodeTypes: NodeTypes = {
+  stepNode: StepNode,
+  blackboardNode: BlackboardNode,
+  agentLabel: AgentLabelNode,
+};
+
+/* ── Main component ──────────────────────────────────────────────────────── */
+
+export function StepCanvas({ steps, agentName, agentInputSchema, agentOutputSchema, selectedId, onSelect }: Props) {
+  const sorted = useMemo(() => [...steps].sort((a, b) => a.order - b.order), [steps]);
+
+  // Build nodes
+  const initialNodes = useMemo(() => {
+    const nodes: Node[] = [];
+    const STEP_W = 210;
+    const STEP_GAP = 60;
+    const stepsStartX = 50;
+    const stepsY = 280;
+    const totalStepsWidth = sorted.length * STEP_W + (sorted.length - 1) * STEP_GAP;
+
+    // Blackboard node (includes agent name as header)
+    const inputFields = (agentInputSchema ?? []).map((f) => ({ name: f.fieldName, type: f.type }));
+    const agentOutputFields = (agentOutputSchema ?? []).map((f) => ({ name: f.fieldName, type: f.type }));
+    const stepGroups = sorted.map((step, i) => ({ idx: i + 1, fields: outputFields(step.outputSchema) }));
+    nodes.push({
+      id: BLACKBOARD_ID,
+      type: "blackboardNode",
+      position: { x: stepsStartX + totalStepsWidth / 2 - 200, y: 20 },
+      data: {
+        agentName: agentName || "Untitled Agent",
+        stepCount: sorted.length,
+        inputFields,
+        agentOutputFields,
+        stepGroups,
+        selected: selectedId === BLACKBOARD_ID || selectedId === AGENT_FRAME_ID,
+        onSelect: () => onSelect(BLACKBOARD_ID),
+      },
+      draggable: true,
+    });
+
+    // Step nodes
+    sorted.forEach((step, i) => {
+      nodes.push({
+        id: step.stepId,
+        type: "stepNode",
+        position: { x: stepsStartX + i * (STEP_W + STEP_GAP), y: stepsY },
+        data: {
+          label: stepTitle(step),
+          idx: i + 1,
+          type: step.type,
+          readCount: (step.readFromBlackboard ?? []).length,
+          writeCount: outputFields(step.outputSchema).length,
+          selected: selectedId === step.stepId,
+          onSelect: () => onSelect(step.stepId),
+        },
+        draggable: true,
+      });
+    });
+
+    return nodes;
+  }, [sorted, agentName, agentInputSchema, selectedId, onSelect]);
+
+  // Build edges
+  const initialEdges = useMemo(() => {
+    const edges: Edge[] = [];
+
+    // Step-to-step horizontal edges
+    sorted.forEach((step, i) => {
+      if (i < sorted.length - 1) {
+        edges.push({
+          id: `e-${step.stepId}-${sorted[i + 1].stepId}`,
+          source: step.stepId,
+          target: sorted[i + 1].stepId,
+          animated: false,
+          style: { stroke: "#d4d4d4", strokeWidth: 2 },
+        });
+      }
+    });
+
+    // Step-to-blackboard edges (for steps with output)
+    sorted.forEach((step) => {
+      if (outputFields(step.outputSchema).length > 0) {
+        edges.push({
+          id: `e-bb-${step.stepId}`,
+          source: step.stepId,
+          sourceHandle: "bb",
+          target: BLACKBOARD_ID,
+          animated: true,
+          style: { stroke: "#f59e0b", strokeWidth: 2 },
+        });
+      }
+    });
+
+    return edges;
+  }, [sorted]);
+
+  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+
+  // Only reset layout when steps actually change (add/remove), not on selection
+  const prevStepIds = useRef<string[]>([]);
+  useEffect(() => {
+    const newIds = sorted.map((s) => s.stepId);
+    const stepsChanged = newIds.join(",") !== prevStepIds.current.join(",");
+    if (stepsChanged || prevStepIds.current.length === 0) {
+      prevStepIds.current = newIds;
+      setNodes(initialNodes);
+      setEdges(initialEdges);
     }
-  }, [pan]);
-  const onMouseMove = useCallback((e: React.MouseEvent) => {
-    if (!isDragging.current) return;
-    setPan({ x: e.clientX - dragStart.current.x, y: e.clientY - dragStart.current.y });
-  }, []);
-  const onMouseUp = useCallback(() => { isDragging.current = false; }, []);
-  const onWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
-    setZoom((z) => Math.min(2, Math.max(0.3, z + (e.deltaY > 0 ? -0.05 : 0.05))));
-  }, []);
+  }, [sorted, initialNodes, initialEdges, setNodes, setEdges]);
+
+  // Update node data (selection state) without resetting positions
+  useEffect(() => {
+    setNodes((nds) =>
+      nds.map((n) => {
+        if (n.id === BLACKBOARD_ID) {
+          return { ...n, data: { ...n.data, selected: selectedId === BLACKBOARD_ID || selectedId === AGENT_FRAME_ID } };
+        }
+        const step = sorted.find((s) => s.stepId === n.id);
+        if (step) {
+          return { ...n, data: { ...n.data, selected: selectedId === n.id } };
+        }
+        return n;
+      }),
+    );
+  }, [selectedId, sorted, setNodes]);
+
+  const onNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
+    onSelect(node.id);
+  }, [onSelect]);
 
   if (sorted.length === 0) {
     return (
@@ -90,213 +355,31 @@ export function StepCanvas({ steps, agentName, agentInputSchema, selectedId, onS
     );
   }
 
-  // Blackboard data
-  const inputFields = (agentInputSchema ?? []).map((f) => ({ name: f.fieldName, type: f.type }));
-  const stepGroups = sorted.map((step, i) => ({
-    idx: i + 1, stepId: step.stepId, fields: outputFields(step.outputSchema),
-  }));
-
   return (
-    <div
-      ref={containerRef}
-      className="relative h-full w-full overflow-hidden bg-neutral-50"
-      style={{ cursor: isDragging.current ? "grabbing" : "grab" }}
-      onMouseDown={onMouseDown}
-      onMouseMove={onMouseMove}
-      onMouseUp={onMouseUp}
-      onMouseLeave={onMouseUp}
-      onWheel={onWheel}
-    >
-      {/* Zoom controls */}
-      <div className="absolute right-3 top-3 z-10 flex items-center gap-0.5 rounded-lg border bg-white/90 px-1.5 py-1 shadow-sm backdrop-blur">
-        <button onClick={() => setZoom((z) => Math.max(0.3, z - 0.1))} className="rounded px-1.5 py-0.5 text-sm text-neutral-500 hover:bg-neutral-100">−</button>
-        <span className="w-10 text-center text-xs text-neutral-400">{Math.round(zoom * 100)}%</span>
-        <button onClick={() => setZoom((z) => Math.min(2, z + 0.1))} className="rounded px-1.5 py-0.5 text-sm text-neutral-500 hover:bg-neutral-100">+</button>
-        <div className="mx-1 h-4 w-px bg-neutral-200" />
-        <button onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }} className="rounded px-1.5 py-0.5 text-xs text-neutral-400 hover:bg-neutral-100">Fit</button>
-      </div>
-
-      {/* Pannable + zoomable content */}
-      <div
-        style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "center center" }}
-        className="flex h-full items-center justify-center p-12"
+    <div style={{ width: "100%", height: "100%" }}>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onNodeClick={onNodeClick}
+        nodeTypes={nodeTypes}
+        fitView
+        fitViewOptions={{ padding: 0.3 }}
+        minZoom={0.2}
+        maxZoom={2}
+        proOptions={{ hideAttribution: true }}
       >
-        {/* ── Agent frame ── */}
-        <div
-          onClick={(e) => {
-            if (e.target === e.currentTarget || (e.target as HTMLElement).dataset?.agentFrame) onSelect(AGENT_FRAME_ID);
+        <Background color="#e5e5e5" gap={20} />
+        <Controls position="top-right" />
+        <MiniMap
+          nodeColor={(n) => {
+            if (n.id === BLACKBOARD_ID) return "#f59e0b";
+            return n.data?.type?.toLowerCase() === "llm" ? "#9333ea" : "#2563eb";
           }}
-          className={`rounded-2xl border-2 p-6 transition-shadow ${
-            selectedId === AGENT_FRAME_ID
-              ? "border-blue-400 bg-blue-50/20 shadow-xl"
-              : "border-neutral-200 bg-white/60 hover:border-neutral-300 hover:shadow-md"
-          }`}
-        >
-          {/* Agent header */}
-          <div data-agent-frame="true" className="mb-5 flex items-center gap-3" onClick={() => onSelect(AGENT_FRAME_ID)}>
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-neutral-900 text-sm font-bold text-white">A</div>
-            <div>
-              <p className="text-sm font-semibold text-neutral-800">{agentName || "Untitled Agent"}</p>
-              <p className="text-xs text-neutral-400">{sorted.length} step{sorted.length !== 1 ? "s" : ""}</p>
-            </div>
-          </div>
-
-          {/* ── Blackboard card ── */}
-          <div
-            onClick={(e) => { e.stopPropagation(); onSelect(BLACKBOARD_ID); }}
-            className={`mb-5 cursor-pointer rounded-xl border-2 p-4 transition-all ${
-              selectedId === BLACKBOARD_ID
-                ? "border-amber-400 bg-amber-50 shadow-lg"
-                : "border-amber-100 bg-amber-50/40 hover:border-amber-300 hover:shadow"
-            }`}
-          >
-            <div className="mb-3 flex items-center gap-2">
-              <div className="flex h-6 w-6 items-center justify-center rounded-md bg-amber-500 text-xs font-bold text-white">B</div>
-              <span className="text-xs font-semibold text-amber-800">Blackboard</span>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {/* Agent input group */}
-              {inputFields.length > 0 && (
-                <div className="rounded-lg border border-neutral-200 bg-white p-2.5 shadow-sm">
-                  <p className="mb-1.5 text-xs font-semibold text-neutral-500">agent_input</p>
-                  {inputFields.map((f) => (
-                    <div key={f.name} className="flex items-center gap-1.5 py-0.5">
-                      <span className="text-xs">📥</span>
-                      <code className="text-xs font-medium text-neutral-700">{f.name}</code>
-                      <span className="text-xs text-neutral-300">{f.type}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Step output groups */}
-              {stepGroups.map((g) => g.fields.length > 0 && (
-                <div key={g.stepId} className="rounded-lg border border-amber-200 bg-white p-2.5 shadow-sm">
-                  <p className="mb-1.5 text-xs font-semibold text-amber-600">Step {g.idx} output</p>
-                  {g.fields.map((f) => (
-                    <div key={f.name} className="flex items-center gap-1.5 py-0.5">
-                      <span className="text-xs">{f.vis === "public" ? "🌐" : "🔒"}</span>
-                      <code className="text-xs font-medium text-neutral-700">{f.name}</code>
-                    </div>
-                  ))}
-                </div>
-              ))}
-
-              {inputFields.length === 0 && stepGroups.every((g) => g.fields.length === 0) && (
-                <p className="py-2 text-xs text-neutral-400">No fields yet — define outputSchema on your steps</p>
-              )}
-            </div>
-          </div>
-
-          {/* ── Arrows from steps to blackboard ── */}
-          <div className="mb-1 flex justify-center">
-            <div className="flex gap-5">
-              {sorted.map((step) => {
-                const has = outputFields(step.outputSchema).length > 0;
-                return (
-                  <div key={`a-${step.stepId}`} className="flex w-48 flex-col items-center">
-                    {has ? (
-                      <svg width="16" height="20" viewBox="0 0 16 20">
-                        <line x1="8" y1="20" x2="8" y2="5" stroke="#f59e0b" strokeWidth="2" />
-                        <polygon points="3,7 8,0 13,7" fill="#f59e0b" />
-                      </svg>
-                    ) : (
-                      <div className="h-5" />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* ── Horizontal steps ── */}
-          <div className="flex items-stretch justify-center gap-2">
-            {sorted.map((step, i) => {
-              const isLast = i === sorted.length - 1;
-              const s = getStyle(step.type);
-              const readFrom = step.readFromBlackboard ?? [];
-
-              return (
-                <div key={step.stepId} className="flex items-center">
-                  {/* Step card — draggable */}
-                  <div
-                    draggable
-                    onDragStart={() => setDraggedIdx(i)}
-                    onDragOver={(e) => { e.preventDefault(); setDropTargetIdx(i); }}
-                    onDragLeave={() => setDropTargetIdx(null)}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      if (draggedIdx !== null && draggedIdx !== i && onStepsReordered) {
-                        const reordered = [...sorted];
-                        const [moved] = reordered.splice(draggedIdx, 1);
-                        reordered.splice(i, 0, moved);
-                        onStepsReordered(reordered.map((s, idx) => ({ ...s, order: idx + 1 })));
-                      }
-                      setDraggedIdx(null);
-                      setDropTargetIdx(null);
-                    }}
-                    onDragEnd={() => { setDraggedIdx(null); setDropTargetIdx(null); }}
-                    onClick={(e) => { e.stopPropagation(); onSelect(step.stepId); }}
-                    className={`w-48 cursor-pointer rounded-xl border-2 p-3.5 transition-all ${
-                      draggedIdx === i ? "opacity-50" : ""
-                    } ${
-                      dropTargetIdx === i && draggedIdx !== i ? "ring-2 ring-blue-400" : ""
-                    } ${
-                      selectedId === step.stepId
-                        ? "border-neutral-800 bg-white shadow-xl ring-2 ring-neutral-200"
-                        : `${s.border} bg-white hover:shadow-md`
-                    }`}
-                  >
-                    {/* Header */}
-                    <div className="mb-2 flex items-center gap-2">
-                      <div className={`flex h-6 w-6 items-center justify-center rounded-full ${s.dot} text-xs font-bold text-white`}>
-                        {i + 1}
-                      </div>
-                      <span className={`rounded-md ${s.bg} px-2 py-0.5 text-xs font-semibold ${s.text}`}>
-                        {step.type.toUpperCase()}
-                      </span>
-                    </div>
-
-                    {/* Title */}
-                    <p className="mb-1.5 text-xs leading-snug text-neutral-600 line-clamp-2">
-                      {stepTitle(step)}
-                    </p>
-
-                    {/* Reads indicator */}
-                    {readFrom.length > 0 && (
-                      <div className="mt-2 flex items-center gap-1 rounded-md bg-blue-50 px-2 py-1">
-                        <span className="text-xs text-blue-400">←</span>
-                        <span className="text-xs text-blue-600">
-                          reads {readFrom.length} field{readFrom.length !== 1 ? "s" : ""}
-                        </span>
-                      </div>
-                    )}
-
-                    {/* Output count */}
-                    {outputFields(step.outputSchema).length > 0 && (
-                      <div className="mt-1.5 flex items-center gap-1 rounded-md bg-amber-50 px-2 py-1">
-                        <span className="text-xs text-amber-400">→</span>
-                        <span className="text-xs text-amber-600">
-                          writes {outputFields(step.outputSchema).length} field{outputFields(step.outputSchema).length !== 1 ? "s" : ""}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Arrow to next step */}
-                  {!isLast && (
-                    <svg width="28" height="20" viewBox="0 0 28 20" className="mx-0.5 shrink-0">
-                      <line x1="2" y1="10" x2="20" y2="10" stroke="#d4d4d4" strokeWidth="2" />
-                      <polygon points="18,4 26,10 18,16" fill="#d4d4d4" />
-                    </svg>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      </div>
+          position="bottom-right"
+        />
+      </ReactFlow>
     </div>
   );
 }

@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     cognito_client_id: str = Field(default="", alias="COGNITO_CLIENT_ID")
     cognito_region: str = Field(default="us-east-1", alias="COGNITO_REGION")
 
+    # ── OpenSearch ─────────────────────────────────────────────────────────────
+    opensearch_endpoint: str = Field(default="", alias="OPENSEARCH_ENDPOINT")
+    opensearch_index: str = Field(default="agent_vectors", alias="OPENSEARCH_INDEX")
+
+    # ── Bedrock Embeddings ────────────────────────────────────────────────────
+    embedding_model_id: str = Field(
+        default="amazon.titan-embed-text-v2:0", alias="EMBEDDING_MODEL_ID"
+    )
+
     # ── AWS Lambda (Agent execution) ──────────────────────────────────────────
     lambda_agent_executor_arn: str = Field(
         default="", alias="LAMBDA_AGENT_EXECUTOR_ARN"

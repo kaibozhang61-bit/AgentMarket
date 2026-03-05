@@ -164,7 +164,7 @@ class AgentDAO(BaseDAO):
         self._table.put_item(Item=item)
         return self._clean(item)
 
-    def publish_draft(self, agent_id: str) -> dict[str, Any] | None:
+    def publish_draft(self, agent_id: str, extra_fields: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """
         Promote DRAFT → LATEST.
         1. Archive current LATEST as VERSION#<timestamp>
@@ -201,6 +201,10 @@ class AgentDAO(BaseDAO):
         source["updatedAt"] = now
         if "steps" in source:
             source["steps"] = _assign_step_ids(source["steps"])
+
+        # Apply extra fields (e.g. stateMachineArn from crash-safe publish)
+        if extra_fields:
+            source.update(extra_fields)
 
         self._table.put_item(Item=source)
 

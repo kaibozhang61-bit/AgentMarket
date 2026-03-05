@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import { Bot, Loader2, Send } from "lucide-react";
 import { AppLayout } from "@/components/layout/app-layout";
-import { StepCanvas, AGENT_FRAME_ID } from "@/components/workflows/step-canvas";
+import { StepCanvas, AGENT_FRAME_ID, BLACKBOARD_ID } from "@/components/workflows/step-canvas";
 import { ResizeHandle } from "@/components/agents/resize-handle";
 import { StepDetailPanel } from "@/components/agents/step-detail-panel";
 import { AgentDetailPanel } from "@/components/agents/agent-detail-panel";
@@ -192,6 +192,15 @@ export function AgentEditor({ agentId: initialAgentId }: Props) {
   async function handleSend() {
     const trimmed = input.trim();
     if (!trimmed || sending) return;
+
+    // Handle "reverify" keyword
+    if (trimmed.toLowerCase() === "reverify" && publishConcerns.length > 0) {
+      setInput("");
+      setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+      handleVerifyPublish();
+      return;
+    }
+
     setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
     setInput("");
     setSending(true);
@@ -224,12 +233,56 @@ export function AgentEditor({ agentId: initialAgentId }: Props) {
     }
   }
 
-  async function handlePublish() {
+  const [publishConcerns, setPublishConcerns] = useState<string[]>([]);
+  const [verifying, setVerifying] = useState(false);
+
+  async function handleVerifyPublish() {
+    if (!agentId) return;
+    setVerifying(true);
+    setPublishConcerns([]);
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: "Verifying your agent before publishing..." },
+    ]);
+    try {
+      const result = await agentsApi.verifyPublish(agentId);
+      if (result.published) {
+        setAgentStatus("published");
+        setPublishConcerns([]);
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "Your agent has been verified and published to the marketplace!" },
+        ]);
+      } else {
+        setPublishConcerns(result.concerns);
+        const concernList = result.concerns.map((c, i) => `${i + 1}. ${c}`).join("\n");
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: `I found some concerns with your agent:\n\n${concernList}\n\nPlease fix these issues and type "reverify", or click **Override** to publish anyway.`,
+          },
+        ]);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Verification failed";
+      setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  async function handleOverridePublish() {
     if (!agentId) return;
     setSaving(true);
     try {
       await agentsApi.publish(agentId);
       setAgentStatus("published");
+      setPublishConcerns([]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Agent published (override). Concerns were skipped." },
+      ]);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Publish failed";
       setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
@@ -376,13 +429,22 @@ export function AgentEditor({ agentId: initialAgentId }: Props) {
                   Test Run
                 </button>
               )}
-              {agentStatus === "draft" && (
+              {agentStatus === "draft" && publishConcerns.length === 0 && (
                 <button
-                  onClick={handlePublish}
-                  disabled={steps.length === 0 || saving}
+                  onClick={handleVerifyPublish}
+                  disabled={steps.length === 0 || saving || verifying}
                   className="rounded-md bg-green-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-700 disabled:opacity-40"
                 >
-                  {saving ? "Publishing…" : "Publish"}
+                  {verifying ? "Verifying…" : "Publish"}
+                </button>
+              )}
+              {agentStatus === "draft" && publishConcerns.length > 0 && (
+                <button
+                  onClick={handleOverridePublish}
+                  disabled={saving}
+                  className="rounded-md bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-40"
+                >
+                  {saving ? "Publishing…" : "Override"}
                 </button>
               )}
             </div>
@@ -393,6 +455,7 @@ export function AgentEditor({ agentId: initialAgentId }: Props) {
               steps={steps}
               agentName={agentName}
               agentInputSchema={agentInputSchema as unknown as import("@/lib/types").FieldSchema[]}
+              agentOutputSchema={agentOutputSchema as unknown as import("@/lib/types").FieldSchema[]}
               selectedId={selectedStepId}
               onSelect={setSelectedStepId}
               onStepsReordered={(reordered) => {
@@ -409,7 +472,7 @@ export function AgentEditor({ agentId: initialAgentId }: Props) {
 
         {/* ── Right: Detail Panel ── */}
         <div className="flex flex-shrink-0 flex-col border-l bg-white" style={{ width: rightWidth }}>
-          {selectedStepId === AGENT_FRAME_ID ? (
+          {selectedStepId === AGENT_FRAME_ID || selectedStepId === BLACKBOARD_ID ? (
             <AgentDetailPanel
               agent={{
                 name: agentName,
@@ -421,6 +484,17 @@ export function AgentEditor({ agentId: initialAgentId }: Props) {
                 callCount: 0,
                 lastUsedAt: null,
               }}
+              stepOutputGroups={steps.map((s, i) => ({
+                stepId: s.stepId,
+                label: `Step ${i + 1}`,
+                fields: (Array.isArray(s.outputSchema) ? s.outputSchema : []).map((f: Record<string, unknown>) => ({
+                  fieldName: (f.fieldName as string) ?? "",
+                  type: (f.type as string) ?? "string",
+                  required: (f.required as boolean) ?? true,
+                  description: (f.description as string) ?? "",
+                  visibility: ((f.visibility as string) ?? "private") as "public" | "private",
+                })),
+              }))}
               onAgentUpdated={(fields) => {
                 if (fields.name) setAgentName(fields.name);
                 if (fields.description !== undefined) setAgentDescription(fields.description);
@@ -434,6 +508,17 @@ export function AgentEditor({ agentId: initialAgentId }: Props) {
                   inputSchema: (fields.inputSchema ?? prev.inputSchema) as Record<string, unknown>[],
                   outputSchema: (fields.outputSchema ?? prev.outputSchema) as Record<string, unknown>[],
                 } : prev);
+              }}
+              onVisibilityChanged={(stepId, fieldName, visibility) => {
+                setSteps((prev) => prev.map((s) => {
+                  if (s.stepId !== stepId) return s;
+                  const schema = Array.isArray(s.outputSchema) ? s.outputSchema : [];
+                  const updated = schema.map((f: Record<string, unknown>) =>
+                    (f.fieldName as string) === fieldName ? { ...f, visibility } : f
+                  );
+                  return { ...s, outputSchema: updated as unknown as Record<string, unknown> };
+                }));
+                isDirty.current = true;
               }}
             />
           ) : (

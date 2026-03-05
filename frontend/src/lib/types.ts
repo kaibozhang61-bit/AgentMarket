@@ -74,6 +74,49 @@ export interface AgentChatResponse {
   stage: string;
   message: string;
   draft: AgentChatDraft | null;
+  searchResults?: SearchResults | null;
+  selectedAgentId?: string | null;
+  executionMode?: string | null;
+  executionInput?: Record<string, unknown> | null;
+  compositionAgents?: string[] | null;
+}
+
+// ── Search Results ───────────────────────────────────────────────────────────
+
+export interface SearchResult {
+  agent_id: string;
+  name: string;
+  description: string;
+  category: string;
+  score: number;
+}
+
+export interface CategoryGroup {
+  category: string;
+  max_score: number;
+  agents: SearchResult[];
+}
+
+export interface SearchResults {
+  path: "direct" | "indirect" | "no_results";
+  results: SearchResult[];
+  categories: CategoryGroup[];
+}
+
+// ── Metrics ──────────────────────────────────────────────────────────────────
+
+export interface MetricValue {
+  status: "available" | "unavailable" | "no_data";
+  value?: number;
+  sample_size?: number;
+  indicative_only?: boolean;
+}
+
+export interface MetricsAnalysis {
+  sessionId: string;
+  status: "analyzing" | "complete";
+  metricResults: Record<string, Record<string, MetricValue>>;
+  missingMetrics: string[];
 }
 
 // ── Marketplace ──────────────────────────────────────────────────────────────
@@ -92,6 +135,7 @@ export interface MarketplaceAgent {
   createdAt: string;
   updatedAt: string;
   level: string;
+  isComposed?: boolean;
 }
 
 // ── Step (used by canvas and agent detail pages) ─────────────────────────────
@@ -99,7 +143,7 @@ export interface MarketplaceAgent {
 export interface Step {
   stepId: string;
   order: number;
-  type: string;
+  type: string;                    // llm | agent | logic
   agentId?: string;
   prompt?: string;
   systemPrompt?: string;
@@ -107,7 +151,25 @@ export interface Step {
   inputMapping?: Record<string, string>;
   missingFieldsResolution?: Record<string, unknown>;
   inputSchema?: Record<string, unknown>[];
-  readFromBlackboard?: string[];  // e.g. ["agent_input.topic", "step_1_output.keywords"]
+  readFromBlackboard?: string[];
+  // Logic step fields (Step Functions compatible)
+  logicType?: "condition" | "transform" | "user_input";
+  condition?: {
+    field: string;
+    threshold: number;
+    then: string;
+    else: string;
+  };
+  transforms?: {
+    output_field: string;
+    method: "static" | "llm" | "regex" | "template";
+    value?: unknown;
+    from_field?: string;
+    prompt?: string;
+    pattern?: string;
+    template?: string;
+  }[];
+  question?: string;               // for user_input steps
 }
 
 /** @deprecated Use Step instead */

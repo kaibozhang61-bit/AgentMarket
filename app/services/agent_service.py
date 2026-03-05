@@ -89,10 +89,27 @@ class AgentService:
                         detail=f"Referenced agent '{ref_id}' not found in marketplace",
                     )
 
+    def _check_draft_quota(self, author_id: str, max_drafts: int = 10) -> None:
+        """
+        Enforce draft quota: each customer can have at most max_drafts draft agents.
+        Published agents don't count toward the quota.
+        """
+        agents = self._dao.list_by_author(author_id)
+        draft_count = sum(1 for a in agents if a.get("status") == "draft")
+        if draft_count >= max_drafts:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Draft quota reached ({max_drafts}). "
+                       f"Publish or delete a draft before creating a new one.",
+            )
+
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
     def create(self, author_id: str, body: AgentCreateRequest) -> dict[str, Any]:
         self._validate_steps(body.steps)
+
+        # Draft quota check
+        self._check_draft_quota(author_id)
 
         data: dict[str, Any] = {
             "name": body.name,
@@ -152,13 +169,117 @@ class AgentService:
     # ── Business actions ──────────────────────────────────────────────────────
 
     def publish(self, agent_id: str, requester_id: str) -> dict[str, Any]:
+        """
+        Crash-safe publish flow:
+        1. Increment publishVersion + set status=pending (crash recovery anchor)
+        2. Create Step Functions State Machine with idempotent name
+        3. DDB status=published + ARN (atomic transaction)
+        """
         agent = self._get_or_404(agent_id)
         self._assert_owner(agent, requester_id)
 
-        result = self._dao.publish_draft(agent_id)
+        # Step 1: Increment version and set pending — this is the idempotency key.
+        # Same draft always gets the same version number on retry.
+        current_version = agent.get("publishVersion", 0)
+        new_version = current_version + 1
+
+        self._dao.update(agent_id, "LATEST", {
+            "status": "pending",
+            "publishVersion": new_version,
+            "stateMachineArn": None,
+        })
+
+        # Step 2: Build and create State Machine (idempotent — handles "already exists")
+        steps = agent.get("steps", [])
+        arn = ""
+        if steps and any(s.get("type") in ("llm", "agent", "logic") for s in steps):
+            try:
+                from app.services.state_machine_service import StateMachineService
+                sm_svc = StateMachineService()
+                definition = sm_svc.build_definition(agent)
+                role_arn = _settings.lambda_agent_executor_arn or "arn:aws:iam::role/placeholder"
+                arn = sm_svc.create_state_machine(agent_id, new_version, definition, role_arn)
+            except Exception:
+                # State Machine creation failed — still publish but without ARN
+                # Recovery job will retry (Step 10)
+                pass
+
+        # Step 3: Publish (status=published + ARN + version)
+        publish_fields: dict[str, Any] = {"publishVersion": new_version}
+        if arn:
+            publish_fields["stateMachineArn"] = arn
+        result = self._dao.publish_draft(agent_id, extra_fields=publish_fields)
         if not result:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
         return result
+
+    def verify_for_publish(self, agent_id: str, requester_id: str) -> dict[str, Any]:
+        """
+        LLM reviews the agent before publishing.
+        Returns { safe: bool, concerns: list[str], published: bool }
+        If safe, publishes automatically. If not, returns concerns.
+        """
+        agent = self._get_or_404(agent_id)
+        self._assert_owner(agent, requester_id)
+
+        # Build a summary of the agent for the LLM to review
+        agent_summary = json.dumps({
+            "name": agent.get("name"),
+            "description": agent.get("description"),
+            "inputSchema": agent.get("inputSchema", []),
+            "outputSchema": agent.get("outputSchema", []),
+            "steps": [
+                {
+                    "order": s.get("order"),
+                    "type": s.get("type"),
+                    "systemPrompt": s.get("systemPrompt", "")[:200],
+                    "inputSchema": s.get("inputSchema", []),
+                    "outputSchema": s.get("outputSchema", []),
+                    "readFromBlackboard": s.get("readFromBlackboard", []),
+                }
+                for s in agent.get("steps", [])
+            ],
+        }, ensure_ascii=False, indent=2)
+
+        review_prompt = (
+            "You are an agent quality reviewer. Review this agent definition "
+            "and check for potential issues before publishing to the marketplace.\n\n"
+            "Check for:\n"
+            "1. Missing or vague system prompts\n"
+            "2. Steps with empty outputSchema\n"
+            "3. readFromBlackboard references that don't match available fields\n"
+            "4. Missing agent-level inputSchema or outputSchema\n"
+            "5. Description that doesn't match what the agent actually does\n"
+            "6. Any logical issues in the step chain\n\n"
+            f"Agent definition:\n{agent_summary}\n\n"
+            "Respond with strict JSON:\n"
+            '{"safe": true/false, "concerns": ["concern 1", "concern 2"]}\n'
+            "If safe, concerns should be an empty list."
+        )
+
+        try:
+            resp = _llm.messages.create(
+                model=_settings.claude_haiku_model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": review_prompt}],
+            )
+            raw = resp.content[0].text
+            # Parse response
+            import re
+            cleaned = re.sub(r"```(?:json)?\s*", "", raw.strip()).rstrip("`").strip()
+            parsed = json.loads(cleaned)
+            safe = parsed.get("safe", True)
+            concerns = parsed.get("concerns", [])
+        except Exception:
+            # If LLM fails, don't block publishing
+            safe = True
+            concerns = []
+
+        if safe:
+            result = self._dao.publish_draft(agent_id)
+            return {"safe": True, "concerns": [], "published": True, "agent": result}
+
+        return {"safe": False, "concerns": concerns, "published": False}
 
     def test(
         self,

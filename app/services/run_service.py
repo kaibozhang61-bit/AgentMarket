@@ -144,7 +144,12 @@ class RunService:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def trigger_run(self, agent_id: str, triggered_by: str) -> dict[str, Any]:
-        """Validate the agent, create a run record, return immediately."""
+        """
+        Validate the agent, create a run record, start execution.
+
+        If the agent has a stateMachineArn (published via crash-safe flow),
+        uses Step Functions StartExecution. Otherwise falls back to in-process.
+        """
         agent = self._get_agent_or_404(agent_id)
         self._assert_owner(agent, triggered_by)
 
@@ -172,7 +177,37 @@ class RunService:
                 detail=f"Agent validation failed: {issues_str}",
             )
 
-        return self._agent_dao.create_run(agent_id, triggered_by)
+        run = self._agent_dao.create_run(agent_id, triggered_by)
+
+        # Try Step Functions execution if ARN exists
+        arn = agent.get("stateMachineArn", "")
+        if arn:
+            return self._start_sfn_execution(agent_id, run, arn)
+
+        return run
+
+    def _start_sfn_execution(
+        self, agent_id: str, run: dict[str, Any], arn: str,
+    ) -> dict[str, Any]:
+        """Start a Step Functions execution for the run."""
+        _sfn = boto3.client("stepfunctions", region_name=_settings.aws_region)
+        run_id = run["runId"]
+        try:
+            _sfn.start_execution(
+                stateMachineArn=arn,
+                name=run_id,
+                input=json.dumps({
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "output": {},
+                }),
+            )
+            run["executionMode"] = "step_functions"
+        except Exception as e:
+            # Fall back — don't fail the run creation
+            run["executionMode"] = "in_process"
+            run["sfnError"] = str(e)
+        return run
 
     def execute_run(
         self, agent_id: str, run_id: str, triggered_by: str,

@@ -84,6 +84,13 @@ export const agentsApi = {
   publish: (agentId: string) =>
     api<Agent>(`/agents/${agentId}/publish`, { method: "POST" }),
 
+  /** POST /agents/{agentId}/verify-publish — LLM review then publish */
+  verifyPublish: (agentId: string) =>
+    api<{ safe: boolean; concerns: string[]; published: boolean; agent?: Agent }>(
+      `/agents/${agentId}/verify-publish`,
+      { method: "POST" },
+    ),
+
   test: (agentId: string, data: { input: Record<string, unknown> }) =>
     api<{ output: Record<string, unknown>; latency_ms: number }>(
       `/agents/${agentId}/test`,

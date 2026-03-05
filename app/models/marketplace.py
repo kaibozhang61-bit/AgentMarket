@@ -31,6 +31,8 @@ class MarketplaceAgentItem(BaseModel):
     updatedAt: str
     # Incremental 2
     level: str = "L1"
+    # Composed agent label
+    isComposed: bool = False
 
 
 class MarketplaceListResponse(BaseModel):

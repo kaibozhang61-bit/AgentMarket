@@ -56,12 +56,15 @@ class MarketplaceService:
         # sort=callCount: GSI2 already returns items sorted by callCount desc
 
         page_items, total = self._paginate(all_agents, page, limit)
-        return {"agents": page_items, "total": total, "page": page}
+        # Enrich with composed label
+        enriched = [self._enrich_agent(a) for a in page_items]
+        return {"agents": enriched, "total": total, "page": page}
 
     def get_agent(self, agent_id: str) -> dict[str, Any]:
         """
         Return a single published+public agent.
         Returns 404 for private or non-existent agents to avoid leaking existence.
+        Composed agents: users see black box — cannot see internal steps.
         """
         agent = self._dao.get(agent_id)
         if (
@@ -73,6 +76,20 @@ class MarketplaceService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Agent not found",
             )
+        return self._enrich_agent(agent)
+
+    @staticmethod
+    def _enrich_agent(agent: dict[str, Any]) -> dict[str, Any]:
+        """Add isComposed flag and strip internal steps for non-owners."""
+        steps = agent.get("steps", [])
+        is_composed = len(steps) > 1
+        agent["isComposed"] = is_composed
+
+        if is_composed:
+            # Black box: hide internal steps from marketplace view
+            # Only expose first step's public inputs and last step's public outputs
+            agent.pop("steps", None)
+
         return agent
 
     def search_agents(
